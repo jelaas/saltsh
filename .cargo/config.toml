@@ -1,0 +1,5 @@
+# Static musl build (spec §8): a single portable Linux binary.
+# The whole crypto stack is pure Rust, so the only libc interaction is the
+# `libc` crate itself (PTY/process syscalls).
+[build]
+target = "x86_64-unknown-linux-musl"

@@ -1,0 +1,67 @@
+# saltsh — NaCl-based remote shell
+#
+# Every dependency is written in Rust. The only FFI surface is `libc`
+# (raw OS syscalls for PTY/process control). No OpenSSL, no libsodium.
+#
+# Versions verified against crates.io (2026-11). Two adjustments were needed
+# relative to the original draft manifest:
+#   * `aes` 0.9 dropped its `ctr` feature — AES-CTR now lives in the `ctr`
+#     crate (ctr 0.10 pairs with cipher 0.5).
+#   * `getrandom` needs the `sys_rng` feature to expose `SysRng`, the tiny
+#     OsRng shim used instead of the full `rand` crate.
+# `sha2` was added for host-key fingerprints (spec §6 requires SHA-256).
+#
+# Commit Cargo.lock to truly pin the transitive graph. Run `cargo tree`
+# to confirm no unwanted C/C++ deps.
+
+[package]
+name = "saltsh"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "A minimal SSH-like remote shell built on NaCl primitives"
+license = "MIT OR Apache-2.0"   # placeholder — choose before publishing
+default-run = "saltsh"
+
+[lib]
+name = "saltsh"
+path = "src/lib.rs"
+
+[[bin]]
+name = "saltsh"
+path = "src/main.rs"
+
+[dependencies]
+# --- NaCl cryptography (pure Rust; RustCrypto / dalek) ---
+x25519-dalek       = "3.0.0"    # X25519 key exchange (forward secrecy)
+ed25519-dalek      = { version = "3.0.0", features = ["rand_core"] }  # host-key + user signatures; rand_core enables generate()
+xsalsa20poly1305   = "0.9.1"    # NaCl crypto_secretbox AEAD (bulk stream cipher)
+hkdf               = "0.13.0"   # session-key derivation
+blake2             = "0.11.0"   # transcript hash + session id
+
+# --- OpenSSH private-key decryption (passphrase support) ---
+bcrypt-pbkdf       = "0.11.0"   # OpenSSH "bcrypt" KDF for encrypted keys
+aes                = "0.9.4"    # aes256-ctr key wrap
+ctr                = "0.10.1"   # AES-CTR block mode (removed from aes 0.9)
+cipher             = "0.5.2"    # StreamCipher trait for CTR decryption
+
+# --- host-key fingerprints (spec §6: SHA-256, OpenSSH-style) ---
+sha2               = "0.11.1"
+
+# --- RNG (small OsRng shim over getrandom; avoids the `rand` crate) ---
+getrandom          = { version = "0.4.3", features = ["sys_rng"] }
+rand_core          = "0.10.1"   # Rng/CryptoRng traits (matches dalek)
+
+# --- memory hygiene / encoding ---
+zeroize            = "1.9.2"    # zero key material on drop
+base64             = "0.23.1"   # OpenSSH key + fingerprint encoding
+
+# --- OS integration (the ONLY FFI surface) ---
+libc               = "0.2.191"  # openpty, fork/exec, setuid, ioctl, getpwnam
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"           # single binary, maximal inlining
+codegen-units = 1
+panic         = "abort"         # smaller static binary (no unwinder)
+strip         = true

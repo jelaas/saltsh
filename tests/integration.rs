@@ -515,6 +515,36 @@ fn low_order_server_eph_is_rejected() {
 }
 
 #[test]
+fn client_cannot_set_server_env() {
+    // The client must never be able to set environment variables in the
+    // remote session. Give the client a distinctive LANG and a marker
+    // variable; neither may appear in the server-side environment.
+    let client_kp = sshkeys::generate_keypair();
+    let (port, dir) = start_server("noenv", &client_kp, true);
+    let identity = write_client_key(&dir, &client_kp);
+
+    let mut cmd = client_cmd(port, &identity, &dir, "127.0.0.1");
+    let out = cmd
+        .env("LANG", "zz_ZZ.UTF-8")
+        .env("SALTSH_MARKER", "should-not-appear")
+        .arg("--")
+        .args(["/usr/bin/env"])
+        .output()
+        .unwrap();
+    let code = out.status.code().unwrap_or(-1);
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let env_out = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !env_out.contains("zz_ZZ.UTF-8"),
+        "client LANG leaked into the remote environment: {env_out}"
+    );
+    assert!(
+        !env_out.contains("SALTSH_MARKER"),
+        "client env leaked into the remote environment: {env_out}"
+    );
+}
+
+#[test]
 fn bidirectional_pty_roundtrip() {
     let client_kp = sshkeys::generate_keypair();
     let (port, dir) = start_server("bidi", &client_kp, true);

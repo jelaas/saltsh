@@ -39,7 +39,10 @@ pub enum Msg {
     AuthFail,
     /// c->s: argv[], TERM, rows, cols, env[] (KEY=VALUE strings). An empty
     /// argv means "no command" — the server picks the login shell, or runs
-    /// a forced command from authorized_keys.
+    /// a forced command from authorized_keys. The env list is always empty
+    /// from the saltsh client and is ignored by the server (clients cannot
+    /// set environment variables in the remote session); it exists for wire
+    /// compatibility only.
     Exec {
         argv: Vec<String>,
         term: String,

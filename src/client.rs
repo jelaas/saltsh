@@ -104,18 +104,21 @@ pub fn run(opts: ClientOpts) -> Result<u32> {
         _ => return Err(Error::proto("expected AUTH_OK/AUTH_FAIL")),
     }
 
-    // 7. Exec request: exact argv, TERM, window size, env (spec §5.5).
+    // 7. Exec request: exact argv, TERM, window size (spec §5.5).
     // An empty argv means "no command" — the server then picks the login
     // shell, or runs a forced command from authorized_keys.
+    // No environment variables are ever sent: the env list in the wire
+    // format is always empty and the server ignores it regardless (the
+    // client must not be able to set variables in the remote session).
+    // TERM is the only client-supplied value the server applies, and it is
+    // a dedicated terminal-type field, not an environment mechanism.
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
     let (rows, cols) = pty::get_winsize(0);
-    let mut env = opts.env.clone();
-    for k in ["LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TZ"] {
-        if let Ok(v) = std::env::var(k) {
-            env.push(format!("{k}={v}"));
-        }
-    }
-    send_msg(&mut writer, &mut sb, &Msg::Exec { argv: opts.argv, term, rows, cols, env })?;
+    send_msg(
+        &mut writer,
+        &mut sb,
+        &Msg::Exec { argv: opts.argv, term, rows, cols, env: Vec::new() },
+    )?;
 
     // 8. Session pump: raw mode + signal forwarding on the stdin side,
     //    socket->stdout on this side. Timeouts come off — idle interactive
@@ -367,7 +370,6 @@ mod tests {
             identity: None,
             passphrase: None,
             accept_new: false,
-            env: vec![],
             argv: vec![],
         };
         assert_eq!(o.host, "h");

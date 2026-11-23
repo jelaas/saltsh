@@ -141,8 +141,14 @@ $ saltsh -p 2323 -l alice -i ~/.ssh/id_ed25519 example.com -- uname -a
 The login name comes from `user@host`, then `-l/--user`, then `$USER`.
 Options: `-p/--port` (23 — the abandoned telnet port), `-i/--identity`
 (`~/.ssh/id_ed25519`), `-P/--passphrase` (prompts if omitted),
-`-e/--env KEY=VALUE` (repeatable; plus `LANG`/`LC_*`/`TZ` when set),
 `--accept-new`.
+
+The client never sends environment variables and cannot set any in the
+remote session: the EXEC message carries only the command argv, the
+terminal type (TERM, a dedicated field required for interactive programs),
+and the window size. A server runs the session with its own environment —
+locale (`LANG`/`LC_*`/`TZ`), `PATH`, `LD_*`, etc. are whatever the server
+already has, and a modified client cannot influence them.
 
 ### Key generation
 

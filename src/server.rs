@@ -168,7 +168,11 @@ fn handle_conn(stream: TcpStream, sk: &SigningKey, opts: &ServerOpts) -> Result<
 
     // --- exec request (spec §5.5)
     let exec = recv_msg(&mut reader, &mut ob)?;
-    let Msg::Exec { argv, term, rows, cols, env } = exec else {
+    // The env list is deliberately ignored: the client must never be able
+    // to set environment variables in the remote session (the wire field
+    // exists for protocol stability only). The only client-supplied value
+    // the server applies is the TERM terminal-type field.
+    let Msg::Exec { argv, term, rows, cols, .. } = exec else {
         return Err(Error::proto("expected EXEC"));
     };
 
@@ -216,7 +220,6 @@ fn handle_conn(stream: TcpStream, sk: &SigningKey, opts: &ServerOpts) -> Result<
     arg_ptrs.push(std::ptr::null());
     let term_c =
         CString::new(term.as_str()).unwrap_or_else(|_| CString::new("xterm").unwrap());
-    let env_pairs: Vec<(CString, CString)> = sanitize_env(&env);
     let (pw_name_c, pw_home_c, pw_ids) = match &run_as {
         RunAs::User(pw) => (
             Some(CString::new(pw.name.clone()).unwrap_or_default()),
@@ -241,7 +244,6 @@ fn handle_conn(stream: TcpStream, sk: &SigningKey, opts: &ServerOpts) -> Result<
         let params = ChildParams {
             arg_cs: &arg_cs,
             arg_ptrs: &arg_ptrs,
-            env_pairs: &env_pairs,
             term_c: &term_c,
             pw_name_c: &pw_name_c,
             pw_home_c: &pw_home_c,
@@ -264,7 +266,6 @@ fn handle_conn(stream: TcpStream, sk: &SigningKey, opts: &ServerOpts) -> Result<
 struct ChildParams<'a> {
     arg_cs: &'a [CString],
     arg_ptrs: &'a [*const c_char],
-    env_pairs: &'a [(CString, CString)],
     term_c: &'a CString,
     pw_name_c: &'a Option<CString>,
     pw_home_c: &'a Option<CString>,
@@ -276,9 +277,11 @@ struct ChildParams<'a> {
 /// returns; uses only async-signal-safe calls (everything is pre-built).
 fn child_side(p: &ChildParams<'_>) -> ! {
     unsafe {
-        for (k, v) in p.env_pairs {
-            libc::setenv(k.as_ptr(), v.as_ptr(), 1);
-        }
+        // Only two environment variables are ever set, and neither takes
+        // its value from client-controlled env input: TERM (dedicated
+        // terminal-type protocol field) and SSH_ORIGINAL_COMMAND (the
+        // requested argv, set only when the administrator's authorized_keys
+        // entry carries a forced command).
         libc::setenv(c"TERM".as_ptr(), p.term_c.as_ptr(), 1);
         if let Some(orig) = p.ssh_original {
             libc::setenv(c"SSH_ORIGINAL_COMMAND".as_ptr(), orig.as_ptr(), 1);
@@ -416,69 +419,6 @@ fn allowed_from(options: &sshkeys::AuthorizedKeyOptions, peer_ip: &str) -> bool 
         None => true,
         Some(list) => sshkeys::match_pattern_list(list, peer_ip),
     }
-}
-
-/// Environment variables that must never be forwarded from the client.
-///
-/// These change how programs resolve and behave — a client restricted by a
-/// `command="..."` forced command could otherwise bypass the restriction by
-/// injecting `PATH` or `LD_PRELOAD`. Also blocked: shell configuration
-/// variables (IFS, ENV, BASH_ENV, ...) and identity variables (USER,
-/// LOGNAME, HOME, SHELL) that would make the session lie about itself.
-/// `TERM` is blocked as an env entry because it has its own protocol field,
-/// set by the server *after* the forwarded env.
-const BLOCKED_ENV: &[&str] = &[
-    "PATH",
-    "LD_PRELOAD",
-    "LD_LIBRARY_PATH",
-    "LD_AUDIT",
-    "LD_DEBUG",
-    "LD_PROFILE",
-    "LD_TRACE_LOADED_OBJECTS",
-    "IFS",
-    "ENV",
-    "BASH_ENV",
-    "SHELLOPTS",
-    "BASHOPTS",
-    "CDPATH",
-    "GLOBIGNORE",
-    "SHELL",
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "GCONV_PATH",
-    "PYTHONPATH",
-    "PYTHONHOME",
-    "PERL5LIB",
-    "PERLLIB",
-    "RUBYLIB",
-    "RUBYOPT",
-    "TERM",
-];
-
-/// Reject anything that isn't a sane `KEY=VALUE` assignment (the client's
-/// EXEC message is untrusted input) and anything on the blocklist.
-fn sanitize_env(env: &[String]) -> Vec<(CString, CString)> {
-    let mut out = Vec::new();
-    for e in env {
-        let Some((k, v)) = e.split_once('=') else { continue };
-        if k.is_empty()
-            || BLOCKED_ENV.contains(&k)
-            || !k.bytes().enumerate().all(|(i, b)| {
-                (i == 0 && (b.is_ascii_alphabetic() || b == b'_'))
-                    || (i > 0 && (b.is_ascii_alphanumeric() || b == b'_'))
-            })
-        {
-            continue;
-        }
-        if v.contains('\0') {
-            continue;
-        }
-        if let (Ok(kc), Ok(vc)) = (CString::new(k), CString::new(v)) {
-            out.push((kc, vc));
-        }
-    }
-    out
 }
 
 /// Parent-side session pump: client bytes -> pty master; pty master ->
@@ -631,36 +571,6 @@ fn recv_msg(r: &mut TcpStream, ob: &mut OpenBox) -> Result<Msg> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn env_sanitization() {
-        let env = vec![
-            "LANG=C.UTF-8".to_string(),
-            "GOOD=1".to_string(),
-            "=BAD".to_string(),
-            "BAD!KEY=1".to_string(),
-            "2BAD=1".to_string(),
-            "NOEQUALS".to_string(),
-            "NUL=a\0b".to_string(),
-        ];
-        let out = sanitize_env(&env);
-        let keys: Vec<&str> = out.iter().map(|(k, _)| k.to_str().unwrap()).collect();
-        assert!(keys.contains(&"LANG"));
-        assert!(keys.contains(&"GOOD"));
-        assert_eq!(out.len(), 2);
-    }
-
-    #[test]
-    fn env_blocklist_is_enforced() {
-        let env: Vec<String> = BLOCKED_ENV
-            .iter()
-            .map(|k| format!("{k}=evil"))
-            .chain(["LANG=C.UTF-8".to_string(), "TZ=UTC".to_string()])
-            .collect();
-        let out = sanitize_env(&env);
-        let keys: Vec<&str> = out.iter().map(|(k, _)| k.to_str().unwrap()).collect();
-        assert_eq!(keys, vec!["LANG", "TZ"]);
-    }
 
     #[test]
     fn status_decoding() {

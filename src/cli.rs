@@ -13,8 +13,6 @@ pub struct ClientOpts {
     pub identity: Option<PathBuf>,
     pub passphrase: Option<String>,
     pub accept_new: bool,
-    /// Extra `KEY=VALUE` environment variables to send.
-    pub env: Vec<String>,
     /// Command argv (after `--` or any extra positionals).
     pub argv: Vec<String>,
 }
@@ -111,7 +109,6 @@ fn parse_client(args: &[String]) -> Result<Command> {
         identity: None,
         passphrase: None,
         accept_new: false,
-        env: Vec::new(),
         argv: Vec::new(),
     };
     let mut host: Option<String> = None;
@@ -147,17 +144,6 @@ fn parse_client(args: &[String]) -> Result<Command> {
                 opts.identity = Some(PathBuf::from(
                     args.get(i).ok_or_else(|| Error::usage("--identity requires a value"))?,
                 ));
-            }
-            "-e" | "--env" => {
-                i += 1;
-                let kv = args
-                    .get(i)
-                    .ok_or_else(|| Error::usage("--env requires KEY=VALUE"))?
-                    .clone();
-                if !kv.contains('=') {
-                    return Err(Error::usage("--env expects KEY=VALUE"));
-                }
-                opts.env.push(kv);
             }
             "-P" | "--passphrase" => {
                 i += 1;
@@ -272,7 +258,6 @@ Client options:
   -l, --user USER          login name (default: $USER; overrides user@host)
   -i, --identity PATH      private key (default: ~/.ssh/id_ed25519)
   -P, --passphrase PASS    private key passphrase (prompts if omitted)
-  -e, --env KEY=VALUE      send an environment variable (repeatable)
       --accept-new         automatically accept a new host key (TOFU)
   -h, --help               show this help
   -V, --version            show version
@@ -333,7 +318,7 @@ mod tests {
     fn client_options() {
         let Command::Client(o) = parse(&s(&[
             "-p", "2223", "-l", "bob", "-i", "/tmp/k", "--accept-new",
-            "-e", "A=1", "-e", "B=2", "host.example", "--", "ls",
+            "host.example", "--", "ls",
         ]))
         .unwrap() else {
             panic!("not client")
@@ -342,7 +327,6 @@ mod tests {
         assert_eq!(o.username, "bob");
         assert_eq!(o.identity, Some(PathBuf::from("/tmp/k")));
         assert!(o.accept_new);
-        assert_eq!(o.env, vec!["A=1", "B=2"]);
         assert_eq!(o.argv, vec!["ls"]);
     }
 

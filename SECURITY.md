@@ -167,19 +167,19 @@ are enforced and unit-tested:
 * argv is passed verbatim to `execvp` (the §2.6 argv guarantee) — the
   server never invokes a shell on the client's string.
 * `TERM` is NUL-checked, capped, and applied via the dedicated protocol
-  field *after* forwarded env (a client cannot override it via `-e TERM=`).
+  field; the client cannot override it with any other mechanism.
 * `rows`/`cols` are clamped to 1..4096 / 1..16384 before the ioctl.
 * `SIGNAL` is range-checked (1..64) and only delivered to the session's own
   child pid, and only before it has been reaped.
-* **Environment blocklist — fixed (F-4):** forwarded env was previously
-  filtered only for syntax. A client holding a `command=`-restricted key
-  could bypass the forced command by injecting `PATH` (redirecting
-  `execvp` for a relative program name) or `LD_PRELOAD`/`LD_LIBRARY_PATH`
-  (code injection into every exec'd binary). The server now drops a
-  blocklist covering the loader variables, shell configuration variables
-  (`IFS`, `ENV`, `BASH_ENV`, …), and identity variables (`USER`, `HOME`,
-  `LOGNAME`, `SHELL`). Verified live: `-e PATH=… -e LD_PRELOAD=…` does not
-  reach the session.
+* **No client-controlled environment variables — hard guarantee:** the
+  server ignores the EXEC `env[]` field entirely (`..` destructuring) and
+  the saltsh client always sends it empty. Only two variables are ever set
+  in the session, neither from client env input: `TERM` (the terminal-type
+  protocol field) and `SSH_ORIGINAL_COMMAND` (the requested argv, set only
+  when the administrator's `authorized_keys` entry carries a forced
+  command). This supersedes the earlier blocklist fix (F-4) with a
+  structural guarantee: even a modified client cannot inject `PATH`,
+  `LD_PRELOAD`, or anything else.
 * Username: length-capped, NUL-free, used only in `getpwnam` (no shell);
   log output is now sanitized of control characters — **fixed (F-5)** —
   preventing log-line forgery via embedded newlines/escapes.
@@ -187,7 +187,7 @@ are enforced and unit-tested:
 ### 3.4 Server: privilege drop (per-user mode)
 
 * `setgid → initgroups → setuid → chdir(home)` in the forked child, in the
-  correct order; any failure exits before exec. All argv/env CStrings and
+  correct order; any failure exits before exec. All argv CStrings and
   pointer arrays are pre-built before `forkpty`, and the child only makes
   async-signal-safe calls between fork and exec.
 * `getpwnam` static storage is protected by a mutex; fields are copied out
@@ -243,7 +243,7 @@ are enforced and unit-tested:
 | # | Finding | Severity | Fix |
 |---|---|---|---|
 | F-1 | Non-contributory X25519 peer key accepted → all-zero shared secret | High | `was_contributory()` check on both sides + integration test |
-| F-4 | Client-forwarded `PATH`/`LD_PRELOAD`/etc. bypasses `command=` restrictions | Medium | Env blocklist in `sanitize_env` + tests, verified live |
+| F-4 | Client-forwarded `PATH`/`LD_PRELOAD`/etc. bypasses `command=` restrictions | Medium | Superseded: the server now ignores the `env[]` field entirely (structural guarantee, verified by `client_cannot_set_server_env`) |
 | F-7 | No handshake timeouts → slowloris thread exhaustion | Medium | 60 s socket timeout during pre-session phase, cleared for the session |
 | F-2 | Rekey thresholds computed but never enforced | Low | Connection dropped at 2^32 packets / 2^40 bytes |
 | F-5 | Control characters in usernames forge log lines | Low | `log_safe()` on all logged wire strings |
@@ -276,10 +276,10 @@ are enforced and unit-tested:
 
 ## 6. Testing
 
-* 36 unit tests + 19 integration tests (55 total), including: tamper
-  detection, framing round-trips, malformed-message rejection, env
-  blocklist, log sanitization, low-order-point rejection (both directions),
-  TOFU pinning, forced commands, `from=` restrictions, privilege drop, and
-  full client↔server sessions.
+* 34 unit tests + 20 integration tests (54 total), including: tamper
+  detection, framing round-trips, malformed-message rejection,
+  client-cannot-set-env, log sanitization, low-order-point rejection (both
+  directions), TOFU pinning, forced commands, `from=` restrictions,
+  privilege drop, and full client↔server sessions.
 * `cargo clippy --all-targets` clean; `SALTSH_TEST_BIN` runs the suite
   against the statically linked musl release artifact.

@@ -15,6 +15,7 @@
 pub mod cli;
 pub mod client;
 pub mod crypto;
+pub mod daemon;
 pub mod error;
 pub mod msg;
 pub mod pty;

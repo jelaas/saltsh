@@ -83,6 +83,8 @@ fn start_server_with(tag: &str, authorized_keys_content: &str, shared: bool) -> 
             port,
             host_key_path: Some(host_key),
             authorized_keys_path: Some(authorized),
+            daemonize: false,
+            pidfile: None,
         }
     } else {
         ServerOpts {
@@ -90,6 +92,8 @@ fn start_server_with(tag: &str, authorized_keys_content: &str, shared: bool) -> 
             port,
             host_key_path: Some(host_key),
             authorized_keys_path: None,
+            daemonize: false,
+            pidfile: None,
         }
     };
     std::thread::spawn(move || {
@@ -542,6 +546,102 @@ fn client_cannot_set_server_env() {
         !env_out.contains("SALTSH_MARKER"),
         "client env leaked into the remote environment: {env_out}"
     );
+}
+
+#[test]
+fn daemonize_detaches_and_serves() {
+    // `serve --daemonize` must exit 0 quickly, write the pidfile, and the
+    // detached daemon must serve sessions.
+    let client_kp = sshkeys::generate_keypair();
+    let dir = TempDir::new("daemon");
+    let host_key = dir.0.join("host_key");
+    let authorized = dir.0.join("authorized_keys");
+    let host_kp = sshkeys::generate_keypair();
+    sshkeys::write_private_key_file(&host_key, &host_kp, "test host").unwrap();
+    std::fs::write(&authorized, sshkeys::authorized_keys_entry(&client_kp.public, "c")).unwrap();
+    let (listener, port) = free_listener();
+    drop(listener); // free the port for the daemon to bind
+
+    let pidfile = dir.0.join("saltsh.pid");
+    let mut cmd = Command::new(bin());
+    let st = cmd
+        .args(["serve", "--listen", "127.0.0.1", "--port", &port.to_string(), "--host-key"])
+        .arg(&host_key)
+        .arg("--authorized-keys")
+        .arg(&authorized)
+        .arg("--daemonize")
+        .arg("--pidfile")
+        .arg(&pidfile)
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "daemonize must exit 0; stderr: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .expect("pidfile written")
+        .trim()
+        .parse()
+        .expect("numeric pid");
+    assert!(pid > 1, "pidfile must hold the daemon's pid");
+
+    // the daemon actually serves
+    let identity = write_client_key(&dir, &client_kp);
+    let (code, stdout) = run_client(port, &identity, &dir, &["/bin/echo", "daemon", "works"]);
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8_lossy(&stdout).trim(), "daemon works");
+}
+
+#[test]
+fn daemonize_reports_bind_errors() {
+    // Bind happens before detaching, so a busy port must fail the command
+    // with a visible error instead of vanishing into the background.
+    let dir = TempDir::new("daemon-bind");
+    let host_key = dir.0.join("host_key");
+    let host_kp = sshkeys::generate_keypair();
+    sshkeys::write_private_key_file(&host_key, &host_kp, "t").unwrap();
+    let (listener, port) = free_listener(); // keeps the port busy
+
+    let out = Command::new(bin())
+        .args(["serve", "--listen", "127.0.0.1", "--port", &port.to_string(), "--host-key"])
+        .arg(&host_key)
+        .arg("--authorized-keys")
+        .arg("/dev/null")
+        .arg("--daemonize")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Address in use"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    drop(listener);
+}
+
+#[test]
+fn keygen_relative_path() {
+    // keygen -f is the one path option that accepts a relative path:
+    // the key and its .pub are written into the current directory.
+    let dir = TempDir::new("keygen-rel");
+    let out = Command::new(bin())
+        .current_dir(&dir.0)
+        .args(["keygen", "-f", "relkey"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dir.0.join("relkey").exists());
+    assert!(dir.0.join("relkey.pub").exists());
+    // the written files are real, parseable keys that match each other
+    let kp = sshkeys::load_private_key(&dir.0.join("relkey"), None).expect("parse private");
+    let pub_text = std::fs::read_to_string(dir.0.join("relkey.pub")).unwrap();
+    let parsed = sshkeys::parse_authorized_keys_line(&pub_text).expect("parse .pub");
+    assert_eq!(parsed.public, kp.public);
 }
 
 #[test]

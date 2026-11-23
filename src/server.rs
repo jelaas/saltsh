@@ -30,6 +30,11 @@ use crate::wire;
 
 /// Listen forever, spawning a thread per connection.
 pub fn run(opts: ServerOpts) -> Result<()> {
+    // Everything fallible happens BEFORE daemonizing, so errors reach the
+    // administrator's terminal: host key load/generation, address
+    // resolution, and the bind itself. (Path options are validated as
+    // absolute by the CLI parser, so the post-daemonize chdir("/") cannot
+    // break them.)
     let host_key_path = opts
         .host_key_path
         .clone()
@@ -37,6 +42,23 @@ pub fn run(opts: ServerOpts) -> Result<()> {
     let sk = sshkeys::load_or_create_host_key(&host_key_path)?;
     let addr = wire::resolve_v4(&opts.listen, opts.port)?;
     let listener = TcpListener::bind(addr).map_err(Error::Io)?;
+
+    // Pidfile: an explicit --pidfile wins; daemonizing defaults to the
+    // classic /var/run/saltsh.pid.
+    let pidfile = opts
+        .pidfile
+        .clone()
+        .or_else(|| opts.daemonize.then(|| PathBuf::from("/var/run/saltsh.pid")));
+    if opts.daemonize {
+        eprintln!(
+            "saltsh: daemonizing (host key fingerprint {}, listening on {})",
+            tofu::fingerprint(&sk.verifying_key().to_bytes()),
+            addr
+        );
+        crate::daemon::daemonize(pidfile.as_deref())?;
+    } else if let Some(path) = &pidfile {
+        std::fs::write(path, format!("{}\n", std::process::id())).map_err(Error::Io)?;
+    }
     serve(listener, sk, opts)
 }
 

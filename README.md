@@ -56,7 +56,21 @@ $ sudo saltsh serve --listen 0.0.0.0 --port 23
 
 # shared-file mode: run everything as the server's own user
 $ saltsh serve --host-key /etc/saltsh/host_key --authorized-keys /etc/saltsh/authorized_keys
+
+# daemon mode — for init scripts and systems without systemd:
+$ sudo saltsh serve --daemonize --pidfile /run/saltsh.pid
+$ kill "$(cat /run/saltsh.pid)"      # stop it
 ```
+
+`--daemonize` performs a classic double-fork (fork → setsid → fork),
+changes to `/`, and redirects stdio to `/dev/null`. The command exits 0
+only once the daemon is actually up: the host key and the listen socket
+are set up *before* detaching, so startup errors (bad key, port already in
+use) still print on your terminal with a non-zero exit. Without
+`--pidfile`, the pid is written to `/var/run/saltsh.pid`. All path options
+(`--host-key`, `--authorized-keys`, `--pidfile`) must be absolute paths.
+Note that when daemonized, log output goes to `/dev/null` (syslog support
+is future work).
 
 ### Host key
 
@@ -141,7 +155,9 @@ $ saltsh -p 2323 -l alice -i ~/.ssh/id_ed25519 example.com -- uname -a
 The login name comes from `user@host`, then `-l/--user`, then `$USER`.
 Options: `-p/--port` (23 — the abandoned telnet port), `-i/--identity`
 (`~/.ssh/id_ed25519`), `-P/--passphrase` (prompts if omitted),
-`--accept-new`.
+`--accept-new`. All path options must be **absolute**, with one exception:
+`keygen -f` may be relative to the current directory. `~` is never
+expanded — use `$HOME/...`.
 
 The client never sends environment variables and cannot set any in the
 remote session: the EXEC message carries only the command argv, the

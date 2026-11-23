@@ -23,6 +23,10 @@ pub struct ServerOpts {
     pub port: u16,
     pub host_key_path: Option<PathBuf>,
     pub authorized_keys_path: Option<PathBuf>,
+    /// Detach from the terminal and run in the background.
+    pub daemonize: bool,
+    /// Pidfile path; defaults to /var/run/saltsh.pid when daemonizing.
+    pub pidfile: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -65,6 +69,9 @@ fn parse_keygen(args: &[String]) -> Result<Command> {
             "-h" | "--help" => return Ok(Command::Help),
             "-f" => {
                 i += 1;
+                // The one deliberate exception to the absolute-path rule:
+                // `keygen -f relkey` writes into the current directory,
+                // matching ssh-keygen's behavior.
                 opts.path = Some(PathBuf::from(
                     args.get(i).ok_or_else(|| Error::usage("-f requires a path"))?,
                 ));
@@ -141,9 +148,10 @@ fn parse_client(args: &[String]) -> Result<Command> {
             }
             "-i" | "--identity" => {
                 i += 1;
-                opts.identity = Some(PathBuf::from(
-                    args.get(i).ok_or_else(|| Error::usage("--identity requires a value"))?,
-                ));
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| Error::usage("--identity requires a value"))?;
+                opts.identity = Some(require_abs(v, "--identity")?);
             }
             "-P" | "--passphrase" => {
                 i += 1;
@@ -198,6 +206,8 @@ fn parse_serve(args: &[String]) -> Result<Command> {
         port: 23,
         host_key_path: None,
         authorized_keys_path: None,
+        daemonize: false,
+        pidfile: None,
     };
     let mut i = 0;
     while i < args.len() {
@@ -219,16 +229,25 @@ fn parse_serve(args: &[String]) -> Result<Command> {
             }
             "--host-key" => {
                 i += 1;
-                opts.host_key_path = Some(PathBuf::from(
-                    args.get(i).ok_or_else(|| Error::usage("--host-key requires a path"))?,
-                ));
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| Error::usage("--host-key requires a path"))?;
+                opts.host_key_path = Some(require_abs(v, "--host-key")?);
             }
             "--authorized-keys" => {
                 i += 1;
-                opts.authorized_keys_path = Some(PathBuf::from(
-                    args.get(i)
-                        .ok_or_else(|| Error::usage("--authorized-keys requires a path"))?,
-                ));
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| Error::usage("--authorized-keys requires a path"))?;
+                opts.authorized_keys_path = Some(require_abs(v, "--authorized-keys")?);
+            }
+            "--daemonize" => opts.daemonize = true,
+            "--pidfile" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| Error::usage("--pidfile requires a path"))?;
+                opts.pidfile = Some(require_abs(v, "--pidfile")?);
             }
             s if s.starts_with('-') => {
                 return Err(Error::usage(format!("unknown option '{s}' (see --help)")));
@@ -245,6 +264,20 @@ fn parse_port(v: &str) -> Result<u16> {
         .map_err(|_| Error::usage(format!("invalid port '{v}'")))
 }
 
+/// Path options must be absolute: saltsh never interprets a path relative
+/// to the current working directory (the daemon chdirs to "/", and
+/// relative paths there have caused real bugs). `~` is not expanded —
+/// use `$HOME/...`.
+fn require_abs(v: &str, flag: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(v);
+    if !path.is_absolute() {
+        return Err(Error::usage(format!(
+            "{flag} requires an absolute path, got '{v}'"
+        )));
+    }
+    Ok(path)
+}
+
 pub const USAGE: &str = "\
 saltsh — a minimal SSH-like remote shell built on NaCl primitives
 
@@ -256,7 +289,8 @@ Usage:
 Client options:
   -p, --port PORT          server port (default: 23, the abandoned telnet port)
   -l, --user USER          login name (default: $USER; overrides user@host)
-  -i, --identity PATH      private key (default: ~/.ssh/id_ed25519)
+  -i, --identity PATH      private key, absolute path (default:
+                           ~/.ssh/id_ed25519)
   -P, --passphrase PASS    private key passphrase (prompts if omitted)
       --accept-new         automatically accept a new host key (TOFU)
   -h, --help               show this help
@@ -268,20 +302,31 @@ Client options:
 Server options:
   -p, --port PORT          listen port (default: 23; binding it requires root)
       --listen ADDR        bind address (default: 0.0.0.0)
-      --host-key PATH      Ed25519 host key, OpenSSH format
-                           (generated if missing; default:
+      --host-key PATH      Ed25519 host key, OpenSSH format (absolute path;
+                           generated if missing; default:
                            /etc/saltsh/host_key as root, else
                            ~/.config/saltsh/host_key)
       --authorized-keys PATH
-                           single authorized_keys file, run commands as the
-                           server's own user. Without this option the server
-                           looks up ~<user>/.ssh/authorized_keys and drops
+                           single authorized_keys file (absolute path), run
+                           commands as the server's own user. Without this
+                           option the server looks up
+                           ~<user>/.saltsh/authorized_keys and drops
                            privileges to <user> (requires root).
+      --daemonize          detach from the terminal and run in the
+                           background (double-fork; for init scripts and
+                           systems without a service manager). Startup
+                           errors are still reported on the terminal.
+      --pidfile PATH       write the server pid here, absolute path
+                           (default when daemonizing: /var/run/saltsh.pid)
 
 Keygen options:
-  -f PATH                  output private key (default: ~/.ssh/saltsh_ed25519)
+  -f PATH                  output private key; may be relative to the
+                           current directory (default: ~/.ssh/saltsh_ed25519)
   -N, --passphrase PASS    encrypt the key with PASS (prompt-free)
   -C, --comment COMMENT    key comment (default: user@host)
+
+  All path options except keygen -f must be absolute; `~` is not expanded
+  (use $HOME/...).
 ";
 
 pub fn version_string() -> String {
@@ -332,15 +377,19 @@ mod tests {
 
     #[test]
     fn serve_options() {
-        let Command::Serve(o) =
-            parse(&s(&["serve", "--listen", "127.0.0.1", "-p", "2222", "--host-key", "/hk"]))
-                .unwrap()
+        let Command::Serve(o) = parse(&s(&[
+            "serve", "--listen", "127.0.0.1", "-p", "2222", "--host-key", "/hk",
+            "--daemonize", "--pidfile", "/run/s.pid",
+        ]))
+        .unwrap()
         else {
             panic!("not serve")
         };
         assert_eq!(o.listen, "127.0.0.1");
         assert_eq!(o.port, 2222);
         assert_eq!(o.host_key_path, Some(PathBuf::from("/hk")));
+        assert!(o.daemonize);
+        assert_eq!(o.pidfile, Some(PathBuf::from("/run/s.pid")));
     }
 
     #[test]
@@ -376,5 +425,26 @@ mod tests {
         assert!(parse(&s(&[])).is_ok()); // help
         assert!(parse(&s(&["--nope", "host"])).is_err());
         assert!(parse(&s(&["host", "-p", "notaport"])).is_err());
+    }
+
+    #[test]
+    fn path_options_must_be_absolute() {
+        // client identity
+        assert!(parse(&s(&["-i", "rel", "host"])).is_err());
+        assert!(parse(&s(&["host", "-i", "./key"])).is_err());
+        assert!(parse(&s(&["host", "-i", "/abs/key"])).is_ok());
+        // server options
+        assert!(parse(&s(&["serve", "--host-key", "rel"])).is_err());
+        assert!(parse(&s(&["serve", "--authorized-keys", "rel"])).is_err());
+        assert!(parse(&s(&["serve", "--pidfile", "rel"])).is_err());
+        assert!(parse(&s(&["serve", "--host-key", "/abs"])).is_ok());
+        // keygen -f is the one exception: relative paths are allowed
+        assert!(parse(&s(&["keygen", "-f", "rel"])).is_ok());
+        assert!(parse(&s(&["keygen", "-f", "/abs/key"])).is_ok());
+        // the message tells the user what happened
+        match parse(&s(&["serve", "--host-key", "rel"])) {
+            Err(Error::Usage(m)) => assert!(m.contains("absolute path"), "{m}"),
+            other => panic!("expected usage error, got {other:?}"),
+        }
     }
 }

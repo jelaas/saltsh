@@ -276,10 +276,10 @@ are enforced and unit-tested:
 
 ## 6. Testing
 
-* 34 unit tests + 20 integration tests (54 total), including: tamper
+* 35 unit tests + 23 integration tests (58 total), including: tamper
   detection, framing round-trips, malformed-message rejection,
   client-cannot-set-env, log sanitization, low-order-point rejection (both
   directions), TOFU pinning, forced commands, `from=` restrictions,
-  privilege drop, and full client↔server sessions.
+  privilege drop, daemonization, and full client↔server sessions.
 * `cargo clippy --all-targets` clean; `SALTSH_TEST_BIN` runs the suite
   against the statically linked musl release artifact.

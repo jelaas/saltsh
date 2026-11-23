@@ -187,8 +187,20 @@ after KEX: `secretbox(nonce, u32_be(len) || plaintext)` with
 ## Build
 
 ```console
+$ make                    # build the static musl release binary
+$ sudo make install       # /usr/local/sbin/saltsh
+$ make test               # run the test suite
+$ make clean
+```
+
+`make` is the greybeard front-end to cargo: `TARGET` picks the Rust target
+(default `x86_64-unknown-linux-musl`; `make TARGET=` builds natively),
+`PREFIX`/`SBINDIR` pick the install location, and `DESTDIR` supports
+packaging. Equivalent cargo invocations:
+
+```console
 $ cargo build --release            # statically linked musl binary (see below)
-$ cargo test                       # 31 unit + 9 end-to-end tests
+$ cargo test                       # 35 unit + 23 end-to-end tests
 ```
 
 `.cargo/config.toml` sets `x86_64-unknown-linux-musl` as the default target

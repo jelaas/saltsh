@@ -30,6 +30,23 @@ pub fn run(opts: ClientOpts) -> Result<u32> {
     // 1. Load the identity, prompting for a passphrase if the file is encrypted.
     let key = load_identity(&opts)?;
 
+    // Resolve the protocol identifier: --protocol wins, else the
+    // ssh_config-style ~/.saltsh/config Host section for this host, else
+    // the default. The config-derived value is validated just like the
+    // flag.
+    let protocol = match opts.protocol.as_deref() {
+        Some(p) => p.to_string(),
+        None => {
+            let configured = util::saltsh_dir()
+                .ok()
+                .map(|d| d.join("config"))
+                .and_then(|p| crate::config::load(&p).ok().flatten())
+                .and_then(|c| c.protocol_for(&opts.host).map(String::from));
+            configured.unwrap_or_else(|| crypto::DEFAULT_VERSION.to_string())
+        }
+    };
+    let protocol = crate::cli::parse_protocol(&protocol)?;
+
     // 2. Connect + version exchange (IPv4 only). A handshake timeout bounds
     // how long an unauthenticated peer can hold this process (cleared for
     // the session). The client speaks first, then expects the server's
@@ -40,14 +57,14 @@ pub fn run(opts: ClientOpts) -> Result<u32> {
     wire::set_handshake_timeout(&stream)?;
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
-    let vline = crypto::version_line(&opts.protocol);
+    let vline = crypto::version_line(&protocol);
     writer.write_all(&vline)?;
     let line = wire::read_line(&mut reader, crypto::MAX_VERSION_LINE)?
         .ok_or_else(|| Error::proto("connection closed during version exchange"))?;
     if line != vline {
         return Err(Error::proto(format!(
             "server speaks a different protocol version: {:?}",
-            wire::display_safe(&line, opts.protocol.len())
+            wire::display_safe(&line, protocol.len())
         )));
     }
 
@@ -379,7 +396,7 @@ mod tests {
             identity: None,
             passphrase: None,
             accept_new: false,
-            protocol: crate::crypto::DEFAULT_VERSION.to_string(),
+            protocol: None,
             argv: vec![],
         };
         assert_eq!(o.host, "h");

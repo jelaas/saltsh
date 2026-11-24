@@ -986,6 +986,147 @@ fn server_clears_env_and_sets_home() {
 }
 
 #[test]
+fn hostkey_preseed_skips_tofu() {
+    // `saltsh hostkey` on the server prints the known_hosts line; once the
+    // client has it in ~/.saltsh/known_hosts, first connect succeeds
+    // WITHOUT --accept-new and without any prompt (stdin is /dev/null, so
+    // a prompt would read EOF and abort).
+    let client_kp = sshkeys::generate_keypair();
+    let dir = TempDir::new("preseed");
+    let host_key = dir.0.join("host_key");
+    let authorized = dir.0.join("authorized_keys");
+    let host_kp = sshkeys::generate_keypair();
+    sshkeys::write_private_key_file(&host_key, &host_kp, "t").unwrap();
+    std::fs::write(&authorized, sshkeys::authorized_keys_entry(&client_kp.public, "c")).unwrap();
+
+    // start the server on a known port
+    let (listener, port) = free_listener();
+    let opts = ServerOpts {
+        listen: "127.0.0.1".to_string(),
+        port,
+        host_key_path: Some(host_key.clone()),
+        authorized_keys_path: Some(authorized),
+        daemonize: false,
+        pidfile: None,
+        protocol: saltsh::crypto::DEFAULT_VERSION.to_string(),
+        log_file: None,
+        log_timestamps: false,
+    };
+    std::thread::spawn(move || {
+        let _ = saltsh::server::run_on(listener, opts);
+    });
+    assert!(wait_ready(port, Instant::now() + Duration::from_secs(10)));
+
+    // admin queries the line on the server side
+    let out = Command::new(bin())
+        .args(["hostkey", "--host-key"])
+        .arg(&host_key)
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("127.0.0.1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let line = String::from_utf8(out.stdout).unwrap();
+    let line = line.trim_end();
+    // the line is exactly the known_hosts format with the host key's blob
+    assert_eq!(
+        line,
+        saltsh::tofu::known_hosts_line("127.0.0.1", port, &host_kp.public)
+    );
+
+    // seed the client's TOFU store with it
+    let kh_dir = dir.0.join(".saltsh");
+    std::fs::create_dir_all(&kh_dir).unwrap();
+    std::fs::write(kh_dir.join("known_hosts"), format!("{line}\n")).unwrap();
+
+    // connect WITHOUT --accept-new: the pin makes the prompt unnecessary
+    let identity = write_client_key(&dir, &client_kp);
+    let mut cmd = Command::new(bin());
+    cmd.args(["-p", &port.to_string(), "-i"])
+        .arg(&identity)
+        .env("HOME", &dir.0)
+        .arg("127.0.0.1")
+        .arg("--")
+        .args(["/bin/echo", "preseeded"]);
+    let out = cmd.output().unwrap();
+    assert_eq!(
+        out.status.code().unwrap_or(-1),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "preseeded");
+}
+
+#[test]
+fn client_config_protocol_per_host() {
+    // The ssh_config-style ~/.saltsh/config supplies the protocol
+    // identifier per Host; --protocol on the command line still wins.
+    let client_kp = sshkeys::generate_keypair();
+    let dir = TempDir::new("cfgproto");
+    let host_key = dir.0.join("host_key");
+    let authorized = dir.0.join("authorized_keys");
+    let host_kp = sshkeys::generate_keypair();
+    sshkeys::write_private_key_file(&host_key, &host_kp, "t").unwrap();
+    std::fs::write(&authorized, sshkeys::authorized_keys_entry(&client_kp.public, "c")).unwrap();
+    let (listener, port) = free_listener();
+    let opts = ServerOpts {
+        listen: "127.0.0.1".to_string(),
+        port,
+        host_key_path: Some(host_key),
+        authorized_keys_path: Some(authorized),
+        daemonize: false,
+        pidfile: None,
+        protocol: "MYSECRET/1".to_string(),
+        log_file: None,
+        log_timestamps: false,
+    };
+    std::thread::spawn(move || {
+        let _ = saltsh::server::run_on(listener, opts);
+    });
+    assert!(wait_ready(port, Instant::now() + Duration::from_secs(10)));
+    let identity = write_client_key(&dir, &client_kp);
+    let kh_dir = dir.0.join(".saltsh");
+    std::fs::create_dir_all(&kh_dir).unwrap();
+    let config = kh_dir.join("config");
+
+    let run = |dir: &TempDir, extra: &[&str]| {
+        let mut cmd = Command::new(bin());
+        cmd.args(["--accept-new", "-p", &port.to_string(), "-i"])
+            .arg(&identity)
+            .env("HOME", &dir.0)
+            .args(extra)
+            .arg("127.0.0.1")
+            .arg("--")
+            .args(["/bin/echo", "cfg-ok"]);
+        cmd.output().unwrap()
+    };
+
+    // 1. matching Host section: config alone is enough
+    std::fs::write(&config, "Host 127.0.0.1\n    Protocol MYSECRET/1\n").unwrap();
+    let out = run(&dir, &[]);
+    assert_eq!(out.status.code().unwrap_or(-1), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "cfg-ok");
+
+    // 2. non-matching Host section: falls back to the default identifier,
+    //    which the server rejects
+    std::fs::write(&config, "Host *.example.com\n    Protocol MYSECRET/1\n").unwrap();
+    let out = run(&dir, &[]);
+    assert_ne!(out.status.code().unwrap_or(0), 0);
+
+    // 3. --protocol on the command line overrides the config (even a
+    //    wrong config value)
+    std::fs::write(&config, "Host 127.0.0.1\n    Protocol WRONG/1\n").unwrap();
+    let out = run(&dir, &["--protocol", "MYSECRET/1"]);
+    assert_eq!(out.status.code().unwrap_or(-1), 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
 fn bidirectional_pty_roundtrip() {
     let client_kp = sshkeys::generate_keypair();
     let (port, dir) = start_server("bidi", &client_kp, true);

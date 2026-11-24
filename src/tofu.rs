@@ -59,6 +59,12 @@ pub fn find<'a>(entries: &'a [HostEntry], host: &str, port: u16) -> Option<&'a [
     entries.iter().find(|e| e.addr == addr).map(|e| &e.key)
 }
 
+/// One `known_hosts` line: `host:port base64(pubkey)` — the exact format
+/// `load()` parses and the client's TOFU store expects.
+pub fn known_hosts_line(host: &str, port: u16, key: &[u8; 32]) -> String {
+    format!("{host}:{port} {}", B64.encode(key))
+}
+
 /// Append (or refresh) a pin, creating the store and its directories.
 ///
 /// Appends are serialized with `flock` because several client processes
@@ -84,7 +90,7 @@ pub fn add(path: &Path, host: &str, port: u16, key: &[u8; 32]) -> Result<()> {
             std::io::Error::last_os_error()
         )));
     }
-    let result = writeln!(f, "{host}:{port} {}", B64.encode(key))
+    let result = writeln!(f, "{}", known_hosts_line(host, port, key))
         .map_err(|e| Error::HostKey(format!("cannot write {}: {e}", path.display())));
     unsafe {
         libc::flock(fd, libc::LOCK_UN);

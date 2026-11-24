@@ -468,10 +468,12 @@ fn split_ssh_tokens(line: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // `from=` pattern lists (OpenSSH match.c semantics, IP candidates only)
 
-/// Match a comma-separated pattern list against `candidate` (an IPv4
-/// address string). Semantics follow OpenSSH's `match_pattern_list`: a
-/// matching negated (`!`) pattern rejects immediately; otherwise the list
-/// matches if any positive pattern matches. saltsh is IPv4-only.
+/// Match a comma-separated pattern list against `candidate` (an IP
+/// address for `from="..."` restrictions, or a hostname for
+/// `~/.saltsh/config` Host sections). Semantics follow OpenSSH's
+/// `match_pattern_list`: a matching negated (`!`) pattern rejects
+/// immediately; otherwise the list matches if any positive pattern
+/// matches.
 pub fn match_pattern_list(list: &str, candidate: &str) -> bool {
     let mut positive = false;
     for raw in list.split(',') {

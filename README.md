@@ -81,6 +81,50 @@ is the recommended companion to `--daemonize`. With `--log-timestamps`,
 every line is prefixed with a local-time `[YYYY-MM-DD HH:MM:SS]` stamp
 (syslog style).
 
+### Client configuration (`~/.saltsh/config`)
+
+Optional, ssh_config-style. Currently one option is honored:
+
+```
+# per-host protocol identifier
+Host *.example.com
+    Protocol MYSECRET/1
+
+Host 10.0.0.*
+    Protocol SALTSH/2
+```
+
+* `Host` starts a section; its patterns (`*`, `?`, `!` negation, comma
+  separated) are matched against the host given on the command line.
+* The **first** matching section wins; within a section the first
+  occurrence of an option wins.
+* Command-line flags always override the file (`--protocol`).
+* Unknown options and malformed lines are ignored.
+
+### Pre-seeding host keys (skip the TOFU prompt)
+
+The TOFU prompt on first connect can be avoided entirely by pinning the
+host key in advance. On the **server**, query the exact line to add:
+
+```console
+$ saltsh hostkey example.com            # default port 23
+example.com:23 AAAA...base64...
+$ saltsh hostkey --port 2323 10.0.0.7   # non-default port
+```
+
+Then append the line to the client's `~/.saltsh/known_hosts`:
+
+```console
+$ echo 'example.com:23 AAAA...base64...' >> ~/.saltsh/known_hosts
+```
+
+The `host:port` part must match exactly what the client is given on its
+command line (hostname as typed, port as connected). `saltsh hostkey`
+reads the local host key file (`--host-key`, or `/etc/saltsh/host_key` as
+root / `~/.saltsh/host_key` otherwise) — no network scan, so there is no
+first-contact MITM ambiguity. A mismatch later still hard-fails, exactly
+like a fresh TOFU pin.
+
 ### Session environment
 
 The server sheds its own inherited environment at startup (only `PATH`
@@ -233,7 +277,7 @@ packaging. Equivalent cargo invocations:
 
 ```console
 $ cargo build --release            # statically linked musl binary (see below)
-$ cargo test                       # 39 unit + 28 end-to-end tests
+$ cargo test                       # 44 unit + 31 end-to-end tests
 ```
 
 `.cargo/config.toml` sets `x86_64-unknown-linux-musl` as the default target

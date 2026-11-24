@@ -68,6 +68,36 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Ok(saltsh::cli::Command::Hostkey(opts)) => {
+            // Print the known_hosts line(s) clients need to pre-seed TOFU,
+            // straight from the local host key file (no network scan, no
+            // MITM ambiguity).
+            let path = opts
+                .host_key_path
+                .clone()
+                .unwrap_or_else(saltsh::util::default_host_key_path);
+            match saltsh::sshkeys::load_private_key(&path, None) {
+                Ok(kp) => {
+                    for host in &opts.hosts {
+                        println!("{}", saltsh::tofu::known_hosts_line(host, opts.port, &kp.public));
+                    }
+                    eprintln!(
+                        "saltsh: host key fingerprint {} ({})",
+                        saltsh::tofu::fingerprint(&kp.public),
+                        path.display()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("saltsh: {e}");
+                    eprintln!(
+                        "saltsh: create one with 'saltsh keygen -f {}' or start 'saltsh serve' once",
+                        path.display()
+                    );
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Ok(saltsh::cli::Command::Client(opts)) => match saltsh::client::run(opts) {
             Ok(code) => ExitCode::from((code & 0xFF) as u8),
             Err(e) => {

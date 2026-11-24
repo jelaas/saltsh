@@ -293,7 +293,7 @@ are enforced and unit-tested:
 
 ## 6. Testing
 
-* 39 unit tests + 29 integration tests (68 total), including: tamper
+* 44 unit tests + 31 integration tests (75 total), including: tamper
   detection, framing round-trips, malformed-message rejection,
   client-cannot-set-env, log sanitization, low-order-point rejection (both
   directions), silent-until-valid handshake, custom protocol identifiers,

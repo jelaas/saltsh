@@ -14,8 +14,9 @@ pub struct ClientOpts {
     pub passphrase: Option<String>,
     pub accept_new: bool,
     /// Protocol identifier sent in the version exchange (default
-    /// "SALTSH/1"); the wire line is `IDENT\n`.
-    pub protocol: String,
+    /// "SALTSH/1", possibly overridden per host by ~/.saltsh/config);
+    /// the wire line is `IDENT\n`. None = not given on the command line.
+    pub protocol: Option<String>,
     /// Command argv (after `--` or any extra positionals).
     pub argv: Vec<String>,
 }
@@ -44,8 +45,19 @@ pub enum Command {
     Client(ClientOpts),
     Serve(ServerOpts),
     Keygen(KeygenOpts),
+    Hostkey(HostkeyOpts),
     Help,
     Version,
+}
+
+#[derive(Debug, Clone)]
+pub struct HostkeyOpts {
+    /// Hostnames/IPs to emit known_hosts lines for.
+    pub hosts: Vec<String>,
+    /// Port pinned in the emitted lines (must match what clients use).
+    pub port: u16,
+    /// Host key file (absolute); default follows the server's rules.
+    pub host_key_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,8 +74,55 @@ pub fn parse(args: &[String]) -> Result<Command> {
         Some("-V") | Some("--version") => Ok(Command::Version),
         Some("serve") | Some("server") => parse_serve(&args[1..]),
         Some("keygen") => parse_keygen(&args[1..]),
+        Some("hostkey") => parse_hostkey(&args[1..]),
         _ => parse_client(args),
     }
+}
+
+/// Parse `saltsh hostkey [--port P] [--host-key PATH] host [host ...]`:
+/// print known_hosts lines for the local host key, pre-seeding client TOFU.
+fn parse_hostkey(args: &[String]) -> Result<Command> {
+    let mut opts = HostkeyOpts {
+        hosts: Vec::new(),
+        port: 23,
+        host_key_path: None,
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            "-h" | "--help" => return Ok(Command::Help),
+            "-V" | "--version" => return Ok(Command::Version),
+            "-p" | "--port" => {
+                i += 1;
+                let v = args.get(i).ok_or_else(|| Error::usage("--port requires a value"))?;
+                opts.port = parse_port(v)?;
+            }
+            "--host-key" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| Error::usage("--host-key requires a path"))?;
+                opts.host_key_path = Some(require_abs(v, "--host-key")?);
+            }
+            s if s.starts_with('-') && s.len() > 1 => {
+                return Err(Error::usage(format!("unknown option '{s}' (see --help)")));
+            }
+            s => {
+                // The host goes verbatim into a known_hosts line, so it must
+                // be a single token of visible ASCII (no whitespace/control).
+                if s.is_empty() || !s.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
+                    return Err(Error::usage(format!("invalid host '{s}'")));
+                }
+                opts.hosts.push(s.to_string());
+            }
+        }
+        i += 1;
+    }
+    if opts.hosts.is_empty() {
+        return Err(Error::usage("hostkey requires at least one host"));
+    }
+    Ok(Command::Hostkey(opts))
 }
 
 fn parse_keygen(args: &[String]) -> Result<Command> {
@@ -126,7 +185,7 @@ fn parse_client(args: &[String]) -> Result<Command> {
         identity: None,
         passphrase: None,
         accept_new: false,
-        protocol: crate::crypto::DEFAULT_VERSION.to_string(),
+        protocol: None,
         argv: Vec::new(),
     };
     let mut host: Option<String> = None;
@@ -150,7 +209,7 @@ fn parse_client(args: &[String]) -> Result<Command> {
                 let v = args
                     .get(i)
                     .ok_or_else(|| Error::usage("--protocol requires a value"))?;
-                opts.protocol = parse_protocol(v)?;
+                opts.protocol = Some(parse_protocol(v)?);
             }
             "-p" | "--port" => {
                 i += 1;
@@ -303,7 +362,7 @@ fn parse_port(v: &str) -> Result<u16> {
 /// Validate a protocol identifier: 1..255 bytes of visible ASCII, no
 /// spaces or control characters (the wire line is `IDENT\n`, and the
 /// identifier is logged, so it must be safe and bounded).
-fn parse_protocol(v: &str) -> Result<String> {
+pub(crate) fn parse_protocol(v: &str) -> Result<String> {
     if v.is_empty() || v.len() > 255 {
         return Err(Error::usage("--protocol must be 1..255 bytes"));
     }
@@ -336,6 +395,7 @@ Usage:
   saltsh [options] [user@]host [--] [argv...]  connect and run a command
   saltsh serve [options]                   run the server (sshd role)
   saltsh keygen [options]                  generate an Ed25519 keypair
+  saltsh hostkey [options] host [host...]  print known_hosts lines
 
 Client options:
   -p, --port PORT          server port (default: 23, the abandoned telnet port)
@@ -345,7 +405,10 @@ Client options:
   -P, --passphrase PASS    private key passphrase (prompts if omitted)
       --accept-new         automatically accept a new host key (TOFU)
       --protocol IDENT     protocol identifier sent in the version exchange
-                           (default: SALTSH/1; both ends must match)
+                           (default: SALTSH/1; both ends must match).
+                           Unless given here, an ssh_config-style
+                           ~/.saltsh/config Host section may set it per
+                           host.
   -h, --help               show this help
   -V, --version            show version
 
@@ -392,6 +455,18 @@ Keygen options:
 
   All path options except keygen -f must be absolute; `~` is not expanded
   (use $HOME/...).
+
+Hostkey options:
+  -p, --port PORT          port to pin (default: 23; must match the port
+                           clients actually use)
+      --host-key PATH      host key file, absolute path (default:
+                           /etc/saltsh/host_key as root, else
+                           ~/.saltsh/host_key)
+  host [host ...]          hostname/IP to emit a line for
+
+  Prints the exact lines to append to a client's ~/.saltsh/known_hosts,
+  pre-seeding TOFU so first connect needs no prompt:
+    saltsh hostkey example.com >> ~/.saltsh/known_hosts
 ";
 
 pub fn version_string() -> String {
@@ -486,6 +561,33 @@ mod tests {
     }
 
     #[test]
+    fn hostkey_parsing() {
+        let Command::Hostkey(o) =
+            parse(&s(&["hostkey", "--host-key", "/etc/hk", "-p", "2323", "a.example", "10.0.0.1"]))
+                .unwrap()
+        else {
+            panic!("not hostkey")
+        };
+        assert_eq!(o.hosts, vec!["a.example", "10.0.0.1"]);
+        assert_eq!(o.port, 2323);
+        assert_eq!(o.host_key_path, Some(PathBuf::from("/etc/hk")));
+        // defaults
+        let Command::Hostkey(o) = parse(&s(&["hostkey", "h"])).unwrap() else {
+            panic!("not hostkey")
+        };
+        assert_eq!(o.port, 23);
+        assert_eq!(o.host_key_path, None);
+        // no hosts -> error
+        assert!(parse(&s(&["hostkey"])).is_err());
+        // hosts must be single safe tokens
+        assert!(parse(&s(&["hostkey", "bad host"])).is_err());
+        assert!(parse(&s(&["hostkey", "bad\nhost"])).is_err());
+        assert!(parse(&s(&["hostkey", ""])).is_err());
+        // host key path must be absolute
+        assert!(parse(&s(&["hostkey", "--host-key", "rel", "h"])).is_err());
+    }
+
+    #[test]
     fn errors() {
         assert!(parse(&s(&[])).is_ok()); // help
         assert!(parse(&s(&["--nope", "host"])).is_err());
@@ -494,15 +596,15 @@ mod tests {
 
     #[test]
     fn protocol_option_validation() {
-        // default is SALTSH/1 on both ends
+        // default is SALTSH/1 on both ends (None = not given on the CLI)
         let Command::Client(o) = parse(&s(&["host"])).unwrap() else { panic!() };
-        assert_eq!(o.protocol, "SALTSH/1");
+        assert_eq!(o.protocol, None);
         let Command::Serve(o) = parse(&s(&["serve"])).unwrap() else { panic!() };
         assert_eq!(o.protocol, "SALTSH/1");
         assert_eq!(o.log_file, None);
         // custom identifiers are accepted on both ends
         let Command::Client(o) = parse(&s(&["--protocol", "MYSECRET/2", "host"])).unwrap() else { panic!() };
-        assert_eq!(o.protocol, "MYSECRET/2");
+        assert_eq!(o.protocol.as_deref(), Some("MYSECRET/2"));
         let Command::Serve(o) =
             parse(&s(&["serve", "--protocol", "X/1", "--log-file", "/var/log/saltsh.log"]))
                 .unwrap()

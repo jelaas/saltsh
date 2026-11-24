@@ -363,7 +363,7 @@ pub fn write_private_key_file(path: &Path, key: &KeyPair, comment: &str) -> Resu
 pub fn keygen(path: &Path, passphrase: Option<&str>, comment: &str) -> Result<KeyPair> {
     if path.exists() {
         return Err(Error::key(format!(
-            "{} already exists; refusing to overwrite",
+            "{} already exists; refusing to overwrite (use -f to pick a different path)",
             path.display()
         )));
     }
@@ -384,7 +384,7 @@ pub fn load_or_create_host_key(path: &Path) -> Result<SigningKey> {
     }
     let kp = generate_keypair();
     write_private_key_file(path, &kp, &format!("saltsh host key {}", hostname()))?;
-    eprintln!("saltsh: generated new host key at {}", path.display());
+    crate::logger::log(format_args!("generated new host key at {}", path.display()));
     Ok(kp.signing_key())
 }
 
@@ -610,15 +610,27 @@ fn write_file_mode(path: &Path, data: &[u8], mode: u32) -> Result<()> {
     Ok(())
 }
 
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
+    // Use gethostname(2): $HOSTNAME is not set on all systems (e.g.
+    // Ubuntu), which would label every generated key "localhost".
+    let mut buf = [0u8; 256];
+    let r = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if r == 0 {
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        if let Ok(s) = std::str::from_utf8(&buf[..end]) {
+            if !s.is_empty() {
+                return s.to_string();
+            }
+        }
+    }
     std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".into())
 }
 
-/// Default identity path: `~/.ssh/id_ed25519`.
+/// Default identity path: `~/.saltsh/id_ed25519`.
 pub fn default_identity_path(home: Option<&Path>) -> PathBuf {
     match home {
-        Some(h) => h.join(".ssh/id_ed25519"),
-        None => PathBuf::from("id_ed25519"),
+        Some(h) => h.join(".saltsh/id_ed25519"),
+        None => PathBuf::from(".saltsh/id_ed25519"),
     }
 }
 

@@ -117,7 +117,12 @@ low-order point over a raw socket).
 
 ### 2.8 Protocol state machine
 
-* Version string compared byte-exact; mismatch aborts.
+* Version exchange: the **server speaks second** and stays silent until the
+  peer sends the correct `IDENT\n` line; anything else is closed without a
+  reply. The identifier is configurable (`--protocol`, default `SALTSH/1`)
+  on both ends and is byte-compared; it feeds the transcript/session ID.
+  The custom identifier only reduces scanner noise — obscurity, not
+  security (explicitly documented as such).
 * After KEX, only AUTH messages are accepted; after AUTH_OK, only EXEC;
   during the session, only PTY_DATA/RESIZE/SIGNAL. Anything else is a
   protocol error and the connection is dropped (fail-closed at every stage).
@@ -161,6 +166,13 @@ are enforced and unit-tested:
 * Length prefix decrypted via the keystream probe, capped at 1 MiB before
   the body buffer is allocated; truncated headers and bodies are handled;
   EINTR-safe reads; EOF distinguished from truncation.
+* The pre-encryption version line is read one byte at a time, capped at
+  256 bytes — a peer cannot make the server buffer arbitrary data.
+* Anything logged from that untrusted line is sanitized
+  (`wire::display_safe`: non-printables become `?`) and truncated to the
+  configured identifier's length, so a hostile banner can neither forge
+  log lines nor flood them. The client applies the same sanitization to
+  its mismatch error message.
 
 ### 3.3 Server: EXEC handling
 
@@ -276,10 +288,11 @@ are enforced and unit-tested:
 
 ## 6. Testing
 
-* 35 unit tests + 23 integration tests (58 total), including: tamper
+* 39 unit tests + 28 integration tests (67 total), including: tamper
   detection, framing round-trips, malformed-message rejection,
   client-cannot-set-env, log sanitization, low-order-point rejection (both
-  directions), TOFU pinning, forced commands, `from=` restrictions,
+  directions), silent-until-valid handshake, custom protocol identifiers,
+  file logging, TOFU pinning, forced commands, `from=` restrictions,
   privilege drop, daemonization, and full client↔server sessions.
 * `cargo clippy --all-targets` clean; `SALTSH_TEST_BIN` runs the suite
   against the statically linked musl release artifact.

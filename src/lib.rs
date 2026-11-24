@@ -8,7 +8,7 @@
 //! * authentication: single Ed25519 challenge/response, key-only (§5.4),
 //! * session: a single PTY carrying an `execvp`'d argv, with resize and
 //!   signal forwarding (§5.5, §5.7),
-//! * host-key trust: TOFU pinning in `~/.config/saltsh/known_hosts` (§6),
+//! * host-key trust: TOFU pinning in `~/.saltsh/known_hosts` (§6),
 //! * OpenSSH key interop: public keys, `authorized_keys`, and private keys
 //!   with `cipher=none` or `bcrypt`+`aes256-ctr` (§7).
 
@@ -17,6 +17,7 @@ pub mod client;
 pub mod crypto;
 pub mod daemon;
 pub mod error;
+pub mod logger;
 pub mod msg;
 pub mod pty;
 pub mod rng;

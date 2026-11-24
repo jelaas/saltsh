@@ -26,18 +26,35 @@ fn main() -> ExitCode {
             }
         },
         Ok(saltsh::cli::Command::Keygen(opts)) => {
+            // Default output path is the client's default identity path, so
+            // `saltsh keygen` followed by `saltsh <host>` just works.
             let path = opts.path.unwrap_or_else(|| {
                 saltsh::util::home_dir()
-                    .map(|h| h.join(".ssh/saltsh_ed25519"))
-                    .unwrap_or_else(|| "saltsh_ed25519".into())
+                    .map(|h| h.join(".saltsh/id_ed25519"))
+                    .unwrap_or_else(|| ".saltsh/id_ed25519".into())
             });
-            match saltsh::sshkeys::keygen(&path, opts.passphrase.as_deref(), &opts.comment) {
+            // Passphrase: `-N pass` uses it verbatim, `-N ''` means no
+            // passphrase, and omitting -N prompts (empty answer = none),
+            // asking twice like ssh-keygen.
+            let passphrase = match opts.passphrase {
+                Some(p) if p.is_empty() => None,
+                Some(p) => Some(p),
+                None => match prompt_key_passphrase() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("saltsh: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+            };
+            match saltsh::sshkeys::keygen(&path, passphrase.as_deref(), &opts.comment) {
                 Ok(kp) => {
                     println!(
-                        "Generated Ed25519 keypair:\n  private: {}\n  public:  {}.pub\n  fingerprint: {}",
+                        "Generated Ed25519 keypair:\n  private: {}\n  public:  {}.pub\n  fingerprint: {}{}",
                         path.display(),
                         path.display(),
-                        saltsh::tofu::fingerprint(&kp.public)
+                        saltsh::tofu::fingerprint(&kp.public),
+                        if passphrase.is_some() { "\n  (the private key is passphrase-protected)" } else { "" }
                     );
                     println!(
                         "Add this line to the server's authorized_keys:\n{}",
@@ -64,4 +81,18 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Interactive passphrase prompt for `saltsh keygen` (ssh-keygen style):
+/// ask twice with echo off; an empty first answer means no passphrase.
+fn prompt_key_passphrase() -> saltsh::Result<Option<String>> {
+    let first = saltsh::pty::read_passphrase("Enter passphrase (empty for no passphrase): ")?;
+    if first.is_empty() {
+        return Ok(None);
+    }
+    let second = saltsh::pty::read_passphrase("Enter same passphrase again: ")?;
+    if *first != *second {
+        return Err(saltsh::Error::usage("passphrases do not match"));
+    }
+    Ok(Some(first.to_string()))
 }

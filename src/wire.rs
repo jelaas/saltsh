@@ -113,6 +113,41 @@ pub fn set_nodelay(stream: &TcpStream) {
     }
 }
 
+/// Read a line (up to and including `\n`) of at most `max` bytes.
+/// Returns `Ok(None)` if the peer closed before sending any byte,
+/// `Ok(Some(partial))` on EOF or `max` bytes without a newline.
+pub fn read_line(r: &mut impl Read, max: usize) -> Result<Option<Vec<u8>>> {
+    let mut buf = Vec::with_capacity(16);
+    let mut byte = [0u8; 1];
+    while buf.len() < max {
+        match r.read(&mut byte) {
+            Ok(0) => {
+                return if buf.is_empty() { Ok(None) } else { Ok(Some(buf)) };
+            }
+            Ok(_) => {
+                buf.push(byte[0]);
+                if byte[0] == b'\n' {
+                    return Ok(Some(buf));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(Some(buf))
+}
+
+/// Render untrusted bytes for log/error display: non-printable bytes are
+/// replaced with `?` and the result is truncated to `max` characters, so
+/// hostile input can neither forge log lines nor flood them.
+pub fn display_safe(bytes: &[u8], max: usize) -> String {
+    bytes
+        .iter()
+        .map(|&b| if (0x20..=0x7E).contains(&b) { b as char } else { '?' })
+        .take(max)
+        .collect()
+}
+
 /// Resolve `host` for an IPv4-only connection (saltsh does not support
 /// IPv6): pick the first IPv4 address DNS returns.
 pub fn resolve_v4(host: &str, port: u16) -> std::io::Result<std::net::SocketAddr> {
@@ -144,4 +179,39 @@ pub fn set_handshake_timeout(stream: &TcpStream) -> std::io::Result<()> {
 pub fn clear_timeouts(stream: &TcpStream) -> std::io::Result<()> {
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn read_line_parses_bounded_lines() {
+        let mut r = Cursor::new(b"SALTSH/1\nrest".to_vec());
+        let line = read_line(&mut r, 256).unwrap().unwrap();
+        assert_eq!(line, b"SALTSH/1\n");
+
+        // empty input -> None
+        let mut r = Cursor::new(b"".to_vec());
+        assert!(read_line(&mut r, 256).unwrap().is_none());
+
+        // EOF without newline -> partial
+        let mut r = Cursor::new(b"partial".to_vec());
+        assert_eq!(read_line(&mut r, 256).unwrap().unwrap(), b"partial");
+
+        // capped at max bytes (no newline seen)
+        let mut r = Cursor::new(b"x".repeat(64).to_vec());
+        let line = read_line(&mut r, 8).unwrap().unwrap();
+        assert_eq!(line.len(), 8);
+    }
+
+    #[test]
+    fn display_safe_sanitizes_and_truncates() {
+        assert_eq!(display_safe(b"ok", 8), "ok");
+        // control characters replaced, never longer than max
+        assert_eq!(display_safe(b"a\nb\r\x1b[31m", 4), "a?b?");
+        assert_eq!(display_safe(b"verylongline", 4), "very");
+        assert_eq!(display_safe(b"\n\x00\xff", 8), "???");
+    }
 }

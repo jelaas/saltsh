@@ -28,13 +28,13 @@ A single encrypted PTY connection:
   `saltsh host -- echo a "b c" d` passes **3** elements, not 4 (the OpenSSH
   argv bug). Resize (SIGWINCH) and signal forwarding (SIGINT/SIGTSTP) are
   supported; the remote exit status is returned to the client.
-* **Host keys** — TOFU pinning in `~/.config/saltsh/known_hosts`
+* **Host keys** — TOFU pinning in `~/.saltsh/known_hosts`
   (`host:port base64(pubkey)` lines). First connect prints the SHA-256
   fingerprint (OpenSSH-style, `ssh-keygen -lf`-compatible) and asks for
   confirmation (`--accept-new` skips the prompt). A key change is a hard
   fail (MITM protection).
 * **Keys** — OpenSSH formats throughout: client identity defaults to
-  `~/.ssh/id_ed25519` (including passphrase-protected `bcrypt` +
+  `~/.saltsh/id_ed25519` (including passphrase-protected `bcrypt` +
   `aes256-ctr` keys, which are unwrapped with pure-Rust `bcrypt-pbkdf` +
   AES-256-CTR), server host keys are OpenSSH-format Ed25519 private keys,
   generated on first start.
@@ -60,6 +60,9 @@ $ saltsh serve --host-key /etc/saltsh/host_key --authorized-keys /etc/saltsh/aut
 # daemon mode — for init scripts and systems without systemd:
 $ sudo saltsh serve --daemonize --pidfile /run/saltsh.pid
 $ kill "$(cat /run/saltsh.pid)"      # stop it
+
+# file logging + a custom protocol identifier (scanner-noise reduction):
+$ sudo saltsh serve --log-file /var/log/saltsh.log --protocol "SALTSH/1"
 ```
 
 `--daemonize` performs a classic double-fork (fork → setsid → fork),
@@ -68,9 +71,15 @@ only once the daemon is actually up: the host key and the listen socket
 are set up *before* detaching, so startup errors (bad key, port already in
 use) still print on your terminal with a non-zero exit. Without
 `--pidfile`, the pid is written to `/var/run/saltsh.pid`. All path options
-(`--host-key`, `--authorized-keys`, `--pidfile`) must be absolute paths.
-Note that when daemonized, log output goes to `/dev/null` (syslog support
-is future work).
+(`--host-key`, `--authorized-keys`, `--pidfile`, `--log-file`) must be
+absolute paths.
+
+Logging goes to stderr by default; with `--log-file PATH` all server
+logging (host-key generation, startup, connections, auth, errors) is
+appended to that file instead — including when daemonized, so a log file
+is the recommended companion to `--daemonize`. With `--log-timestamps`,
+every line is prefixed with a local-time `[YYYY-MM-DD HH:MM:SS]` stamp
+(syslog style).
 
 ### Host key
 
@@ -82,7 +91,7 @@ the server never prompts for a passphrase.
 
 1. `--host-key PATH`, if given;
 2. otherwise `/etc/saltsh/host_key` when running as root;
-3. otherwise `~/.config/saltsh/host_key` (i.e. `$XDG_CONFIG_HOME/saltsh/host_key`).
+3. otherwise `~/.saltsh/host_key`.
 
 **Generating it** — three ways, all equivalent:
 
@@ -110,7 +119,7 @@ $ ssh-keygen -lf /etc/saltsh/host_key
 ```
 
 **Rotating the host key**: clients pin the old key in
-`~/.config/saltsh/known_hosts` and will hard-fail with
+`~/.saltsh/known_hosts` and will hard-fail with
 "REMOTE HOST IDENTIFICATION HAS CHANGED" after a rotation. Remove the stale
 `host:port` line (or the whole file) from each client to re-pin.
 
@@ -149,13 +158,14 @@ command="/opt/backup/run" ssh-ed25519 AAAA... backup-bot
 $ saltsh example.com                    # default: $SHELL login shell
 $ saltsh alice@example.com              # log in as a specific user
 $ saltsh example.com -- echo a "b c" d  # exact argv, no shell re-splitting
-$ saltsh -p 2323 -l alice -i ~/.ssh/id_ed25519 example.com -- uname -a
+$ saltsh -p 2323 -l alice -i ~/.saltsh/id_ed25519 example.com -- uname -a
 ```
 
 The login name comes from `user@host`, then `-l/--user`, then `$USER`.
 Options: `-p/--port` (23 — the abandoned telnet port), `-i/--identity`
-(`~/.ssh/id_ed25519`), `-P/--passphrase` (prompts if omitted),
-`--accept-new`. All path options must be **absolute**, with one exception:
+(`~/.saltsh/id_ed25519`), `-P/--passphrase` (prompts if omitted),
+`--accept-new`, `--protocol IDENT` (default `SALTSH/1`; must match the
+server's). All path options must be **absolute**, with one exception:
 `keygen -f` may be relative to the current directory. `~` is never
 expanded — use `$HOME/...`.
 
@@ -169,17 +179,25 @@ already has, and a modified client cannot influence them.
 ### Key generation
 
 ```console
-$ saltsh keygen -f ~/.ssh/saltsh_ed25519   # -N passphrase encrypts the key
+$ saltsh keygen                  # writes ~/.saltsh/id_ed25519, prompts for a passphrase
+$ saltsh keygen -N ''            # no passphrase
+$ saltsh keygen -N 'hunter22'    # non-interactive passphrase
 ```
 
-Writes OpenSSH-format keys (compatible with `ssh-keygen -y`), or you can
-keep using `ssh-keygen -t ed25519` directly — both work interchangeably.
+The default output path is the client's default identity, so `saltsh
+keygen` followed by `saltsh <host>` just works. Keys are OpenSSH-format
+(compatible with `ssh-keygen -y`), and you can keep using
+`ssh-keygen -t ed25519` instead — both work interchangeably.
 
 ## Wire protocol (summary)
 
-See §5 of the spec. Fixed version line `SALTSH/1\n`; fixed cipher suite —
-there is no negotiation and therefore no downgrade surface. Packet framing
-after KEX: `secretbox(nonce, u32_be(len) || plaintext)` with
+See §5 of the spec. Fixed cipher suite — there is no negotiation and
+therefore no downgrade surface. The version identifier defaults to
+`SALTSH/1` and is configurable with `--protocol` on both ends; the server
+stays **silent** until a peer sends the correct `IDENT\n` line, so port
+scanners get no banner. A custom identifier only reduces scan noise — it
+is obscurity, not security (anyone can capture it). Packet framing after
+KEX: `secretbox(nonce, u32_be(len) || plaintext)` with
 `nonce = u64_be(seq) || 0^16`, one counter per direction. Message tags:
 `0x01..0x05` auth, `0x10` exec, `0x20` pty data, `0x21` resize,
 `0x22` exit status, `0x30` signal. All integers big-endian.
@@ -200,7 +218,7 @@ packaging. Equivalent cargo invocations:
 
 ```console
 $ cargo build --release            # statically linked musl binary (see below)
-$ cargo test                       # 35 unit + 23 end-to-end tests
+$ cargo test                       # 39 unit + 28 end-to-end tests
 ```
 
 `.cargo/config.toml` sets `x86_64-unknown-linux-musl` as the default target

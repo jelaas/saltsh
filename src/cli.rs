@@ -13,6 +13,9 @@ pub struct ClientOpts {
     pub identity: Option<PathBuf>,
     pub passphrase: Option<String>,
     pub accept_new: bool,
+    /// Protocol identifier sent in the version exchange (default
+    /// "SALTSH/1"); the wire line is `IDENT\n`.
+    pub protocol: String,
     /// Command argv (after `--` or any extra positionals).
     pub argv: Vec<String>,
 }
@@ -27,6 +30,13 @@ pub struct ServerOpts {
     pub daemonize: bool,
     /// Pidfile path; defaults to /var/run/saltsh.pid when daemonizing.
     pub pidfile: Option<PathBuf>,
+    /// Protocol identifier expected in the version exchange (default
+    /// "SALTSH/1"); the wire line is `IDENT\n`.
+    pub protocol: String,
+    /// Append all server logging to this file instead of stderr.
+    pub log_file: Option<PathBuf>,
+    /// Prefix every log line with a local timestamp.
+    pub log_timestamps: bool,
 }
 
 #[derive(Debug)]
@@ -40,7 +50,7 @@ pub enum Command {
 
 #[derive(Debug, Clone)]
 pub struct KeygenOpts {
-    /// Output path (default `~/.ssh/saltsh_ed25519`).
+    /// Output path (default `~/.saltsh/id_ed25519`).
     pub path: Option<PathBuf>,
     pub passphrase: Option<String>,
     pub comment: String,
@@ -102,7 +112,7 @@ fn parse_keygen(args: &[String]) -> Result<Command> {
         opts.comment = format!(
             "{}@{}",
             util::default_username(),
-            std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".into())
+            crate::sshkeys::hostname()
         );
     }
     Ok(Command::Keygen(opts))
@@ -116,6 +126,7 @@ fn parse_client(args: &[String]) -> Result<Command> {
         identity: None,
         passphrase: None,
         accept_new: false,
+        protocol: crate::crypto::DEFAULT_VERSION.to_string(),
         argv: Vec::new(),
     };
     let mut host: Option<String> = None;
@@ -134,6 +145,13 @@ fn parse_client(args: &[String]) -> Result<Command> {
             "-h" | "--help" => return Ok(Command::Help),
             "-V" | "--version" => return Ok(Command::Version),
             "--accept-new" => opts.accept_new = true,
+            "--protocol" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| Error::usage("--protocol requires a value"))?;
+                opts.protocol = parse_protocol(v)?;
+            }
             "-p" | "--port" => {
                 i += 1;
                 let v = args.get(i).ok_or_else(|| Error::usage("--port requires a value"))?;
@@ -208,6 +226,9 @@ fn parse_serve(args: &[String]) -> Result<Command> {
         authorized_keys_path: None,
         daemonize: false,
         pidfile: None,
+        protocol: crate::crypto::DEFAULT_VERSION.to_string(),
+        log_file: None,
+        log_timestamps: false,
     };
     let mut i = 0;
     while i < args.len() {
@@ -249,6 +270,21 @@ fn parse_serve(args: &[String]) -> Result<Command> {
                     .ok_or_else(|| Error::usage("--pidfile requires a path"))?;
                 opts.pidfile = Some(require_abs(v, "--pidfile")?);
             }
+            "--protocol" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| Error::usage("--protocol requires a value"))?;
+                opts.protocol = parse_protocol(v)?;
+            }
+            "--log-file" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| Error::usage("--log-file requires a path"))?;
+                opts.log_file = Some(require_abs(v, "--log-file")?);
+            }
+            "--log-timestamps" => opts.log_timestamps = true,
             s if s.starts_with('-') => {
                 return Err(Error::usage(format!("unknown option '{s}' (see --help)")));
             }
@@ -262,6 +298,21 @@ fn parse_serve(args: &[String]) -> Result<Command> {
 fn parse_port(v: &str) -> Result<u16> {
     v.parse::<u16>()
         .map_err(|_| Error::usage(format!("invalid port '{v}'")))
+}
+
+/// Validate a protocol identifier: 1..255 bytes of visible ASCII, no
+/// spaces or control characters (the wire line is `IDENT\n`, and the
+/// identifier is logged, so it must be safe and bounded).
+fn parse_protocol(v: &str) -> Result<String> {
+    if v.is_empty() || v.len() > 255 {
+        return Err(Error::usage("--protocol must be 1..255 bytes"));
+    }
+    if !v.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
+        return Err(Error::usage(
+            "--protocol may contain only visible ASCII (no spaces or control characters)",
+        ));
+    }
+    Ok(v.to_string())
 }
 
 /// Path options must be absolute: saltsh never interprets a path relative
@@ -290,9 +341,11 @@ Client options:
   -p, --port PORT          server port (default: 23, the abandoned telnet port)
   -l, --user USER          login name (default: $USER; overrides user@host)
   -i, --identity PATH      private key, absolute path (default:
-                           ~/.ssh/id_ed25519)
+                           ~/.saltsh/id_ed25519)
   -P, --passphrase PASS    private key passphrase (prompts if omitted)
       --accept-new         automatically accept a new host key (TOFU)
+      --protocol IDENT     protocol identifier sent in the version exchange
+                           (default: SALTSH/1; both ends must match)
   -h, --help               show this help
   -V, --version            show version
 
@@ -305,7 +358,7 @@ Server options:
       --host-key PATH      Ed25519 host key, OpenSSH format (absolute path;
                            generated if missing; default:
                            /etc/saltsh/host_key as root, else
-                           ~/.config/saltsh/host_key)
+                           ~/.saltsh/host_key)
       --authorized-keys PATH
                            single authorized_keys file (absolute path), run
                            commands as the server's own user. Without this
@@ -318,11 +371,23 @@ Server options:
                            errors are still reported on the terminal.
       --pidfile PATH       write the server pid here, absolute path
                            (default when daemonizing: /var/run/saltsh.pid)
+      --protocol IDENT     protocol identifier expected in the version
+                           exchange (default: SALTSH/1; both ends must
+                           match). The server stays silent until a peer
+                           sends the correct identifier — this only cuts
+                           down on scanner noise, it is not real security.
+      --log-file PATH      append all server logging to this file instead
+                           of stderr (absolute path)
+      --log-timestamps    prefix every log line with a local timestamp
+                           ([YYYY-MM-DD HH:MM:SS])
 
 Keygen options:
   -f PATH                  output private key; may be relative to the
-                           current directory (default: ~/.ssh/saltsh_ed25519)
-  -N, --passphrase PASS    encrypt the key with PASS (prompt-free)
+                           current directory (default: ~/.saltsh/id_ed25519,
+                           the client's default identity)
+  -N, --passphrase PASS    encrypt the key with PASS; '-N \"\"' means no
+                           passphrase. Omit -N to be prompted (empty
+                           answer = no passphrase).
   -C, --comment COMMENT    key comment (default: user@host)
 
   All path options except keygen -f must be absolute; `~` is not expanded
@@ -425,6 +490,39 @@ mod tests {
         assert!(parse(&s(&[])).is_ok()); // help
         assert!(parse(&s(&["--nope", "host"])).is_err());
         assert!(parse(&s(&["host", "-p", "notaport"])).is_err());
+    }
+
+    #[test]
+    fn protocol_option_validation() {
+        // default is SALTSH/1 on both ends
+        let Command::Client(o) = parse(&s(&["host"])).unwrap() else { panic!() };
+        assert_eq!(o.protocol, "SALTSH/1");
+        let Command::Serve(o) = parse(&s(&["serve"])).unwrap() else { panic!() };
+        assert_eq!(o.protocol, "SALTSH/1");
+        assert_eq!(o.log_file, None);
+        // custom identifiers are accepted on both ends
+        let Command::Client(o) = parse(&s(&["--protocol", "MYSECRET/2", "host"])).unwrap() else { panic!() };
+        assert_eq!(o.protocol, "MYSECRET/2");
+        let Command::Serve(o) =
+            parse(&s(&["serve", "--protocol", "X/1", "--log-file", "/var/log/saltsh.log"]))
+                .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(o.protocol, "X/1");
+        assert_eq!(o.log_file, Some(PathBuf::from("/var/log/saltsh.log")));
+        assert!(!o.log_timestamps);
+        let Command::Serve(o) = parse(&s(&["serve", "--log-timestamps"])).unwrap() else {
+            panic!()
+        };
+        assert!(o.log_timestamps);
+        // invalid identifiers are rejected
+        assert!(parse(&s(&["--protocol", "", "host"])).is_err());
+        assert!(parse(&s(&["--protocol", "has space", "host"])).is_err());
+        assert!(parse(&s(&["--protocol", "ctrl\nchar", "host"])).is_err());
+        assert!(parse(&s(&["--protocol", &"x".repeat(256), "host"])).is_err());
+        // log-file must be absolute
+        assert!(parse(&s(&["serve", "--log-file", "rel.log"])).is_err());
     }
 
     #[test]

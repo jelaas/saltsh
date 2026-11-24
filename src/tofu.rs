@@ -1,7 +1,7 @@
 //! Host-key trust: TOFU pinning (spec §6).
 //!
-//! Store: `~/.config/saltsh/known_hosts` (or `$XDG_CONFIG_HOME`), one line
-//! per host: `host:port base64(Ed25519 pubkey)`. First connect prompts with
+//! Store: `~/.saltsh/known_hosts`, one line per host:
+//! `host:port base64(Ed25519 pubkey)`. First connect prompts with
 //! the SHA-256 fingerprint (OpenSSH-style); a key change is a hard fail.
 
 use std::fs::OpenOptions;
@@ -24,7 +24,7 @@ pub struct HostEntry {
 
 /// Path to the known_hosts store.
 pub fn known_hosts_path() -> Result<PathBuf> {
-    Ok(util::config_dir()?.join("saltsh").join("known_hosts"))
+    Ok(util::saltsh_dir()?.join("known_hosts"))
 }
 
 /// Load the store, silently skipping malformed lines.

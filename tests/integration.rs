@@ -50,6 +50,21 @@ impl Drop for TempDir {
     }
 }
 
+/// Guard for servers spawned as real processes: kills and reaps on drop
+/// where the environment permits it. Some sandboxes deny `kill(2)`; there
+/// the process is simply left running (the environment reclaims it).
+struct ServerProc(Option<std::process::Child>);
+
+impl Drop for ServerProc {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.0.take() {
+            if c.kill().is_ok() {
+                let _ = c.wait();
+            }
+        }
+    }
+}
+
 /// Allocate a bound listener on an OS-assigned free port; keeping it bound
 /// (rather than closing and re-binding) makes the port race-free.
 fn free_listener() -> (TcpListener, u16) {
@@ -65,7 +80,7 @@ fn kill_works() -> bool {
 
 /// Start an in-process `saltsh serve` with a freshly generated host key and
 /// the given `authorized_keys` file content. `shared_authorized_keys = false`
-/// exercises the per-user `~/.ssh/authorized_keys` lookup path (requires
+/// exercises the per-user `~user/.saltsh/authorized_keys` lookup path (requires
 /// root; the test skips itself otherwise).
 fn start_server_with(tag: &str, authorized_keys_content: &str, shared: bool) -> (u16, TempDir) {
     let dir = TempDir::new(tag);
@@ -85,6 +100,9 @@ fn start_server_with(tag: &str, authorized_keys_content: &str, shared: bool) -> 
             authorized_keys_path: Some(authorized),
             daemonize: false,
             pidfile: None,
+            protocol: saltsh::crypto::DEFAULT_VERSION.to_string(),
+            log_file: None,
+            log_timestamps: false,
         }
     } else {
         ServerOpts {
@@ -94,6 +112,9 @@ fn start_server_with(tag: &str, authorized_keys_content: &str, shared: bool) -> 
             authorized_keys_path: None,
             daemonize: false,
             pidfile: None,
+            protocol: saltsh::crypto::DEFAULT_VERSION.to_string(),
+            log_file: None,
+            log_timestamps: false,
         }
     };
     std::thread::spawn(move || {
@@ -126,7 +147,7 @@ fn wait_ready(port: u16, deadline: Instant) -> bool {
 }
 
 /// Run the client binary against `port`, returning (exit code, stdout).
-/// `dir` provides an isolated `$XDG_CONFIG_HOME` so TOFU pins never leak
+/// `dir` provides an isolated `$HOME` so TOFU pins never leak
 /// between tests (or runs — port numbers get reused by the OS, and a stale
 /// pin for a reused port would correctly hard-fail as key rotation).
 fn run_client(port: u16, identity: &Path, dir: &TempDir, argv: &[&str]) -> (i32, Vec<u8>) {
@@ -136,12 +157,14 @@ fn run_client(port: u16, identity: &Path, dir: &TempDir, argv: &[&str]) -> (i32,
     (out.status.code().unwrap_or(-1), out.stdout)
 }
 
-/// Base client command: pins TOFU config to `dir` and targets `host`.
+/// Base client command: pins the home directory to `dir` (isolating the
+/// TOFU store at `$HOME/.saltsh/known_hosts` from other tests) and targets
+/// `host`.
 fn client_cmd(port: u16, identity: &Path, dir: &TempDir, host: &str) -> Command {
     let mut cmd = Command::new(bin());
     cmd.args(["--accept-new", "-p", &port.to_string(), "-i"])
         .arg(identity)
-        .env("XDG_CONFIG_HOME", &dir.0)
+        .env("HOME", &dir.0)
         .arg(host);
     cmd
 }
@@ -627,7 +650,7 @@ fn keygen_relative_path() {
     let dir = TempDir::new("keygen-rel");
     let out = Command::new(bin())
         .current_dir(&dir.0)
-        .args(["keygen", "-f", "relkey"])
+        .args(["keygen", "-N", "", "-f", "relkey"])
         .output()
         .unwrap();
     assert!(
@@ -642,6 +665,277 @@ fn keygen_relative_path() {
     let pub_text = std::fs::read_to_string(dir.0.join("relkey.pub")).unwrap();
     let parsed = sshkeys::parse_authorized_keys_line(&pub_text).expect("parse .pub");
     assert_eq!(parsed.public, kp.public);
+}
+
+#[test]
+fn keygen_prompts_for_passphrase_interactively() {
+    // Default keygen (no -N) must ask for the passphrase twice over the
+    // terminal (echo off) and encrypt the private key with the answer.
+    use std::os::fd::{AsRawFd as _, FromRawFd};
+    use std::os::unix::process::CommandExt as _;
+
+    fn wait_for_prompts(mut f: &std::fs::File, buf: &mut Vec<u8>, want: usize) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let mut pfd = libc::pollfd {
+                fd: f.as_raw_fd(),
+                events: libc::POLLIN | libc::POLLHUP,
+                revents: 0,
+            };
+            let n = unsafe { libc::poll(&mut pfd, 1, 200) };
+            if n > 0 {
+                let mut chunk = [0u8; 128];
+                match f.read(&mut chunk) {
+                    Ok(0) => return false,
+                    Ok(r) => buf.extend_from_slice(&chunk[..r]),
+                    Err(_) => return false,
+                }
+            } else if n < 0 {
+                return false;
+            }
+            let seen = buf
+                .windows(b"passphrase".len())
+                .filter(|w| *w == b"passphrase")
+                .count();
+            if seen >= want {
+                return true;
+            }
+        }
+        false
+    }
+
+    let dir = TempDir::new("keygen-prompt");
+    let mut master: libc::c_int = 0;
+    let mut slave: libc::c_int = 0;
+    let ws = libc::winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
+    unsafe {
+        assert_eq!(
+            libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), &ws),
+            0,
+            "openpty"
+        );
+    }
+    let out_path = dir.0.join("pk");
+    let mut cmd = Command::new(bin());
+    cmd.args(["keygen", "-f"])
+        .arg(&out_path)
+        .stdin(Stdio::from(unsafe { std::fs::File::from_raw_fd(slave) }))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Detach from any controlling terminal so /dev/tty is unavailable and
+    // the prompt falls back to our pty slave (fd 0).
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+
+    let mut master_f = unsafe { std::fs::File::from_raw_fd(master) };
+    let mut seen = Vec::new();
+    let ok1 = wait_for_prompts(&master_f, &mut seen, 1);
+    assert!(
+        ok1,
+        "first prompt; got {:?} (child status: {:?})",
+        String::from_utf8_lossy(&seen),
+        child.try_wait().unwrap()
+    );
+    master_f.write_all(b"hunter22\n").unwrap();
+    assert!(wait_for_prompts(&master_f, &mut seen, 2), "second prompt");
+    master_f.write_all(b"hunter22\n").unwrap();
+
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("passphrase-protected"),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    // the key is really encrypted with the typed passphrase
+    assert!(sshkeys::load_private_key(&out_path, None).is_err());
+    let kp = sshkeys::load_private_key(&out_path, Some("hunter22")).expect("decrypt");
+    assert!(sshkeys::load_private_key(&out_path, Some("wrong")).is_err());
+    let _ = kp;
+}
+
+#[test]
+fn server_silent_until_valid_protocol() {
+    // The server must not send anything before the client speaks, must
+    // close silently on a wrong identifier, and must answer with the
+    // version line once the correct one arrives.
+    let client_kp = sshkeys::generate_keypair();
+    let (port, _dir) = start_server("silent", &client_kp, true);
+
+    // 1. no banner: connect and wait — nothing may arrive
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
+    let mut buf = [0u8; 16];
+    assert!(
+        s.read(&mut buf).is_err(),
+        "server must stay silent until spoken to"
+    );
+    // 2. garbage (a scanner): closed without any reply
+    s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let r = s.read(&mut buf);
+    assert!(
+        matches!(r, Ok(0) | Err(_)),
+        "server must close silently on a bad identifier"
+    );
+    // 3. correct identifier: server replies with the identical line
+    let mut s2 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s2.write_all(b"SALTSH/1\n").unwrap();
+    let mut line = [0u8; 9];
+    s2.read_exact(&mut line).unwrap();
+    assert_eq!(&line, b"SALTSH/1\n");
+}
+
+#[test]
+fn custom_protocol_identifier() {
+    // Both ends configured with the same identifier must interoperate; a
+    // client with the default identifier is rejected (silently closed).
+    let client_kp = sshkeys::generate_keypair();
+    let dir = TempDir::new("proto");
+    let host_key = dir.0.join("host_key");
+    let authorized = dir.0.join("authorized_keys");
+    let host_kp = sshkeys::generate_keypair();
+    sshkeys::write_private_key_file(&host_key, &host_kp, "t").unwrap();
+    std::fs::write(&authorized, sshkeys::authorized_keys_entry(&client_kp.public, "c")).unwrap();
+    let (listener, port) = free_listener();
+    let opts = ServerOpts {
+        listen: "127.0.0.1".to_string(),
+        port,
+        host_key_path: Some(host_key),
+        authorized_keys_path: Some(authorized),
+        daemonize: false,
+        pidfile: None,
+        protocol: "MYSECRET/1".to_string(),
+        log_file: None,
+        log_timestamps: false,
+    };
+    std::thread::spawn(move || {
+        let _ = saltsh::server::run_on(listener, opts);
+    });
+    assert!(wait_ready(port, Instant::now() + Duration::from_secs(10)));
+    let identity = write_client_key(&dir, &client_kp);
+
+    // default-identifier client is refused
+    let out = client_cmd(port, &identity, &dir, "127.0.0.1")
+        .arg("--")
+        .arg("/bin/true")
+        .output()
+        .unwrap();
+    assert_ne!(out.status.code().unwrap_or(0), 0);
+
+    // matching client works end to end
+    let out = Command::new(bin())
+        .args(["--protocol", "MYSECRET/1", "--accept-new", "-p", &port.to_string(), "-i"])
+        .arg(&identity)
+        .env("HOME", &dir.0)
+        .arg("127.0.0.1")
+        .arg("--")
+        .args(["/bin/echo", "secret", "handshake"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code().unwrap_or(-1),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "secret handshake");
+}
+
+#[test]
+fn server_logs_to_file() {
+    // --log-file routes all server logging into the file (spawn the real
+    // binary: run_on deliberately does not touch the process stderr).
+    let client_kp = sshkeys::generate_keypair();
+    let dir = TempDir::new("logfile");
+    let host_key = dir.0.join("host_key");
+    let authorized = dir.0.join("authorized_keys");
+    let host_kp = sshkeys::generate_keypair();
+    sshkeys::write_private_key_file(&host_key, &host_kp, "t").unwrap();
+    std::fs::write(&authorized, sshkeys::authorized_keys_entry(&client_kp.public, "c")).unwrap();
+    let log_path = dir.0.join("saltsh.log");
+    let (listener, port) = free_listener();
+    drop(listener);
+    let mut cmd = Command::new(bin());
+    let _srv = ServerProc(Some(
+        cmd.args(["serve", "--listen", "127.0.0.1", "--port", &port.to_string(), "--host-key"])
+            .arg(&host_key)
+            .arg("--authorized-keys")
+            .arg(&authorized)
+            .arg("--log-file")
+            .arg(&log_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    ));
+    assert!(wait_ready(port, Instant::now() + Duration::from_secs(10)));
+    let identity = write_client_key(&dir, &client_kp);
+    let (code, _) = run_client(port, &identity, &dir, &["/bin/echo", "logged"]);
+    assert_eq!(code, 0);
+    let log = std::fs::read_to_string(&log_path).expect("log file written");
+    assert!(log.contains("executing"), "log contents: {log}");
+    assert!(log.contains("connection from"), "log contents: {log}");
+}
+
+#[test]
+fn server_log_timestamps() {
+    // With --log-timestamps every server log line carries a
+    // [YYYY-MM-DD HH:MM:SS] prefix; without the flag, none do.
+    let client_kp = sshkeys::generate_keypair();
+    let dir = TempDir::new("logts");
+    let host_key = dir.0.join("host_key");
+    let authorized = dir.0.join("authorized_keys");
+    let host_kp = sshkeys::generate_keypair();
+    sshkeys::write_private_key_file(&host_key, &host_kp, "t").unwrap();
+    std::fs::write(&authorized, sshkeys::authorized_keys_entry(&client_kp.public, "c")).unwrap();
+    let log_path = dir.0.join("saltsh.log");
+    let (listener, port) = free_listener();
+    drop(listener);
+    let _srv = ServerProc(Some(
+        Command::new(bin())
+            .args(["serve", "--listen", "127.0.0.1", "--port", &port.to_string(), "--host-key"])
+            .arg(&host_key)
+            .arg("--authorized-keys")
+            .arg(&authorized)
+            .arg("--log-file")
+            .arg(&log_path)
+            .arg("--log-timestamps")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    ));
+    assert!(wait_ready(port, Instant::now() + Duration::from_secs(10)));
+    let identity = write_client_key(&dir, &client_kp);
+    let (code, _) = run_client(port, &identity, &dir, &["/bin/true"]);
+    assert_eq!(code, 0);
+    let log = std::fs::read_to_string(&log_path).expect("log file written");
+    assert!(!log.is_empty());
+    for line in log.lines() {
+        assert!(
+            line.starts_with('[') && line.len() >= 21,
+            "line missing timestamp: {line:?}"
+        );
+        // [YYYY-MM-DD HH:MM:SS] shape
+        let b = line.as_bytes();
+        assert_eq!(&b[5], &b'-');
+        assert_eq!(&b[8], &b'-');
+        assert_eq!(&b[11], &b' ');
+        assert_eq!(&b[14], &b':');
+        assert_eq!(&b[17], &b':');
+        assert_eq!(&b[20], &b']');
+        assert!(line[21..].starts_with(" saltsh:"), "line: {line:?}");
+    }
 }
 
 #[test]

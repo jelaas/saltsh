@@ -17,8 +17,20 @@ use xsalsa20poly1305::{Nonce, XSalsa20Poly1305};
 
 use crate::error::{Error, Result};
 
-/// Wire protocol version line (spec §5.1).
-pub const VERSION_LINE: &[u8] = b"SALTSH/1\n";
+/// Default protocol identifier (the version line, without the trailing
+/// newline). Configurable via `--protocol` on both ends; the wire format
+/// is always `IDENT\n`.
+pub const DEFAULT_VERSION: &str = "SALTSH/1";
+/// Maximum length of a version line (identifier + newline).
+pub const MAX_VERSION_LINE: usize = 256;
+
+/// The wire version line for a protocol identifier: `IDENT\n`.
+pub fn version_line(ident: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(ident.len() + 1);
+    v.extend_from_slice(ident.as_bytes());
+    v.push(b'\n');
+    v
+}
 
 /// Domain separator for host-key signatures (spec §5.2).
 pub const HOST_SIG_CONTEXT: &[u8] = b"saltsh-host-key-v1";
@@ -262,10 +274,10 @@ mod tests {
 
     #[test]
     fn session_id_changes_with_inputs() {
-        let v = VERSION_LINE;
+        let v = version_line(DEFAULT_VERSION);
         let z = [0u8; 32];
-        let s1 = session_id(v, v, &z, &z, &z);
-        let s2 = session_id(v, v, &z, &z, &[1u8; 32]);
+        let s1 = session_id(&v, &v, &z, &z, &z);
+        let s2 = session_id(&v, &v, &z, &z, &[1u8; 32]);
         assert_ne!(s1, s2);
     }
 }

@@ -21,7 +21,9 @@ const READY_TIMEOUT_MS: libc::c_int = 15_000;
 /// Detach the current process into the background and write `pidfile`
 /// (if any). The calling (parent) process never returns: it exits 0 once
 /// the daemon signals readiness, or 1 with an error message.
-pub fn daemonize(pidfile: Option<&Path>) -> Result<()> {
+/// `keep_stderr` leaves fd 2 alone (used with `--log-file`, where stderr
+/// was already redirected to the log).
+pub fn daemonize(pidfile: Option<&Path>, keep_stderr: bool) -> Result<()> {
     // The pidfile is required to be an absolute path by the CLI parser, so
     // the post-fork chdir("/") cannot relocate it.
     let mut fds = [0 as libc::c_int; 2];
@@ -55,7 +57,9 @@ pub fn daemonize(pidfile: Option<&Path>) -> Result<()> {
         if devnull >= 0 {
             libc::dup2(devnull, 0);
             libc::dup2(devnull, 1);
-            libc::dup2(devnull, 2);
+            if !keep_stderr {
+                libc::dup2(devnull, 2);
+            }
             if devnull > 2 {
                 libc::close(devnull);
             }
@@ -86,7 +90,7 @@ fn parent_side(rfd: libc::c_int, wfd: libc::c_int) -> ! {
     };
     let n = unsafe { libc::poll(&mut pfd, 1, READY_TIMEOUT_MS) };
     if n <= 0 {
-        eprintln!("saltsh: daemon failed to signal readiness");
+        crate::logger::log(format_args!("daemon failed to signal readiness"));
         std::process::exit(1);
     }
     let mut msg = String::new();
@@ -94,7 +98,7 @@ fn parent_side(rfd: libc::c_int, wfd: libc::c_int) -> ! {
     if msg.trim_start().starts_with("OK") {
         std::process::exit(0);
     }
-    eprintln!("saltsh: daemon startup failed: {}", msg.trim());
+    crate::logger::log(format_args!("daemon startup failed: {}", msg.trim()));
     std::process::exit(1);
 }
 

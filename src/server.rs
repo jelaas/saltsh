@@ -17,8 +17,10 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 use zeroize::Zeroize;
 
 use crate::cli::ServerOpts;
-use crate::crypto::{derive_keys, session_id, OpenBox, SealBox, VERSION_LINE};
+use crate::crypto;
+use crate::crypto::{derive_keys, session_id, OpenBox, SealBox};
 use crate::error::{Error, Result};
+use crate::logger::logline;
 use crate::msg::{self, Msg};
 use crate::pty;
 use crate::rng;
@@ -30,11 +32,39 @@ use crate::wire;
 
 /// Listen forever, spawning a thread per connection.
 pub fn run(opts: ServerOpts) -> Result<()> {
+    // --log-timestamps: applies to every server log line from here on.
+    if opts.log_timestamps {
+        crate::logger::enable_timestamps();
+    }
+    // --log-file: redirect stderr to the log file first, so ALL subsequent
+    // logging (host key generation, startup, connections, errors) goes
+    // there. Done before the host key load and before daemonizing; the
+    // daemon then keeps fd 2 pointing at the file.
+    let log_file = match &opts.log_file {
+        Some(path) => {
+            use std::os::fd::AsRawFd;
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| {
+                    Error::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("cannot open log file {}: {e}", path.display()),
+                    ))
+                })?;
+            let fd = f.as_raw_fd();
+            unsafe { libc::dup2(fd, 2) };
+            Some(f)
+        }
+        None => None,
+    };
+
     // Everything fallible happens BEFORE daemonizing, so errors reach the
-    // administrator's terminal: host key load/generation, address
-    // resolution, and the bind itself. (Path options are validated as
-    // absolute by the CLI parser, so the post-daemonize chdir("/") cannot
-    // break them.)
+    // administrator's terminal (or the log file): host key
+    // load/generation, address resolution, and the bind itself. (Path
+    // options are validated as absolute by the CLI parser, so the
+    // post-daemonize chdir("/") cannot break them.)
     let host_key_path = opts
         .host_key_path
         .clone()
@@ -50,12 +80,13 @@ pub fn run(opts: ServerOpts) -> Result<()> {
         .clone()
         .or_else(|| opts.daemonize.then(|| PathBuf::from("/var/run/saltsh.pid")));
     if opts.daemonize {
-        eprintln!(
-            "saltsh: daemonizing (host key fingerprint {}, listening on {})",
+        logline!(
+            "daemonizing (host key fingerprint {}, listening on {})",
             tofu::fingerprint(&sk.verifying_key().to_bytes()),
             addr
         );
-        crate::daemon::daemonize(pidfile.as_deref())?;
+        // Keep stderr when logging to a file (fd 2 was redirected above).
+        crate::daemon::daemonize(pidfile.as_deref(), log_file.is_some())?;
     } else if let Some(path) = &pidfile {
         std::fs::write(path, format!("{}\n", std::process::id())).map_err(Error::Io)?;
     }
@@ -76,8 +107,8 @@ pub fn run_on(listener: TcpListener, opts: ServerOpts) -> Result<()> {
 
 fn serve(listener: TcpListener, sk: SigningKey, opts: ServerOpts) -> Result<()> {
     let local = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
-    eprintln!(
-        "saltsh: host key fingerprint {} ({}): {}",
+    logline!(
+        "host key fingerprint {} ({}): {}",
         tofu::fingerprint(&sk.verifying_key().to_bytes()),
         opts.host_key_path
             .clone()
@@ -85,25 +116,27 @@ fn serve(listener: TcpListener, sk: SigningKey, opts: ServerOpts) -> Result<()> 
             .display(),
         if opts.authorized_keys_path.is_some() { "shared authorized_keys" } else { "per-user authorized_keys" }
     );
-    eprintln!("saltsh: listening on {local}");
+    logline!("listening on {local}");
 
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
                 let sk = sk.clone();
                 let opts = opts.clone();
+                // Note: the "connection from" line itself is logged inside
+                // handle_conn, only AFTER the peer sends a valid protocol
+                // line — silent scans produce no log spam.
                 let peer = stream
                     .peer_addr()
                     .map(|a| a.to_string())
                     .unwrap_or_else(|_| "?".into());
-                eprintln!("saltsh: connection from {peer}");
                 thread::spawn(move || {
                     if let Err(e) = handle_conn(stream, &sk, &opts) {
-                        eprintln!("saltsh: connection {peer} failed: {e}");
+                        logline!("connection {peer} failed: {e}");
                     }
                 });
             }
-            Err(e) => eprintln!("saltsh: accept error: {e}"),
+            Err(e) => logline!("accept error: {e}"),
         }
     }
     Ok(())
@@ -113,7 +146,7 @@ fn serve(listener: TcpListener, sk: SigningKey, opts: ServerOpts) -> Result<()> 
 enum RunAs {
     /// The server process's own identity (used with --authorized-keys).
     CurrentUser,
-    /// Drop privileges to this user (per-user ~/.ssh/authorized_keys).
+    /// Drop privileges to this user (per-user ~/.saltsh/authorized_keys).
     User(Passwd),
 }
 
@@ -138,16 +171,26 @@ fn handle_conn(stream: TcpStream, sk: &SigningKey, opts: &ServerOpts) -> Result<
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
 
-    // --- version exchange (spec §5.1)
-    writer.write_all(VERSION_LINE)?;
-    let mut ver = [0u8; VERSION_LINE.len()];
-    wire::read_exact(&mut reader, &mut ver)?;
-    if ver != VERSION_LINE {
-        return Err(Error::proto(format!(
-            "client speaks a different protocol version: {:?}",
-            String::from_utf8_lossy(&ver)
-        )));
+    // --- version exchange (spec §5.1). The server speaks second: it stays
+    // silent until the client sends the correct `IDENT\n` line, so port
+    // scanners get no banner. A mismatching or unsolicited line is closed
+    // without a reply; the attempt is logged, but the untrusted bytes are
+    // sanitized and truncated to the configured identifier's length.
+    let vline = crypto::version_line(&opts.protocol);
+    let client_line = match wire::read_line(&mut reader, crypto::MAX_VERSION_LINE)? {
+        None => return Ok(()), // connected and left without speaking
+        Some(l) => l,
+    };
+    if client_line != vline {
+        logline!(
+            "connection {peer_ip}: protocol mismatch (got {:?}, expected {:?})",
+            wire::display_safe(&client_line, opts.protocol.len()),
+            opts.protocol
+        );
+        return Ok(());
     }
+    logline!("connection from {peer_ip}");
+    writer.write_all(&vline)?;
 
     // --- key exchange (spec §5.2)
     let mut client_eph = [0u8; 32];
@@ -163,7 +206,7 @@ fn handle_conn(stream: TcpStream, sk: &SigningKey, opts: &ServerOpts) -> Result<
         return Err(Error::proto("low-order public key in key exchange"));
     }
     let shared_bytes = shared.to_bytes();
-    let sid = session_id(VERSION_LINE, VERSION_LINE, &client_eph, &eph_pub.to_bytes(), &shared_bytes);
+    let sid = session_id(&client_line, &vline, &client_eph, &eph_pub.to_bytes(), &shared_bytes);
     let host_pk = sk.verifying_key().to_bytes();
     let host_sig: Signature = sk.sign(&msg::host_auth_message(&sid));
     // Note: the host public key is sent alongside the signature (not spelled
@@ -275,8 +318,8 @@ fn handle_conn(stream: TcpStream, sk: &SigningKey, opts: &ServerOpts) -> Result<
         child_side(&params);
     }
 
-    eprintln!(
-        "saltsh: user '{}' executing {:?} (pid {pid})",
+    logline!(
+        "user '{}' executing {:?} (pid {pid})",
         log_safe(&username),
         arg_cs
     );
@@ -428,7 +471,7 @@ fn lookup_allowed_keys(
     }
     let keys = sshkeys::read_authorized_keys(&path);
     if keys.is_empty() {
-        eprintln!("saltsh: warning: no usable keys in {}", path.display());
+        logline!("warning: no usable keys in {}", path.display());
     }
     let found = find_allowed(keys);
     Ok((found.is_some(), RunAs::User(pw), found.flatten()))
@@ -473,7 +516,7 @@ fn session_pump(
                 // Nudge stragglers holding the pty open (background jobs).
                 unsafe { libc::kill(-pid, libc::SIGHUP) };
                 nudge_at = Some(Instant::now());
-                eprintln!("saltsh: session pid {pid} exited ({exit_code})");
+                logline!("session pid {pid} exited ({exit_code})");
             }
         }
 

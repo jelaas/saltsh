@@ -12,8 +12,9 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 use zeroize::Zeroize;
 
 use crate::cli::ClientOpts;
+use crate::crypto;
 use crate::crypto::{
-    derive_keys, session_id, OpenBox, SealBox, HOST_SIG_CONTEXT, VERSION_LINE,
+    derive_keys, session_id, OpenBox, SealBox, HOST_SIG_CONTEXT,
 };
 use crate::error::{Error, Result};
 use crate::msg::{self, Msg};
@@ -31,20 +32,22 @@ pub fn run(opts: ClientOpts) -> Result<u32> {
 
     // 2. Connect + version exchange (IPv4 only). A handshake timeout bounds
     // how long an unauthenticated peer can hold this process (cleared for
-    // the session).
+    // the session). The client speaks first, then expects the server's
+    // identical line.
     let addr = wire::resolve_v4(&opts.host, opts.port).map_err(Error::Io)?;
     let stream = TcpStream::connect(addr).map_err(Error::Io)?;
     wire::set_nodelay(&stream);
     wire::set_handshake_timeout(&stream)?;
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
-    writer.write_all(VERSION_LINE)?;
-    let mut ver = [0u8; VERSION_LINE.len()];
-    wire::read_exact(&mut reader, &mut ver)?;
-    if ver != VERSION_LINE {
+    let vline = crypto::version_line(&opts.protocol);
+    writer.write_all(&vline)?;
+    let line = wire::read_line(&mut reader, crypto::MAX_VERSION_LINE)?
+        .ok_or_else(|| Error::proto("connection closed during version exchange"))?;
+    if line != vline {
         return Err(Error::proto(format!(
             "server speaks a different protocol version: {:?}",
-            String::from_utf8_lossy(&ver)
+            wire::display_safe(&line, opts.protocol.len())
         )));
     }
 
@@ -67,8 +70,8 @@ pub fn run(opts: ClientOpts) -> Result<u32> {
     }
     let shared_bytes = shared.to_bytes();
     let sid = session_id(
-        VERSION_LINE,
-        VERSION_LINE,
+        &vline,
+        &vline,
         &eph_pub.to_bytes(),
         &server_eph,
         &shared_bytes,
@@ -150,6 +153,12 @@ fn load_identity(opts: &ClientOpts) -> Result<sshkeys::KeyPair> {
                 meta.mode() & 0o777
             );
         }
+    }
+    if !path.exists() {
+        return Err(Error::key(format!(
+            "no private key at {} — run 'saltsh keygen' to create one",
+            path.display()
+        )));
     }
     if let Some(pass) = &opts.passphrase {
         return sshkeys::load_private_key(&path, Some(pass)).map_err(|e| {
@@ -370,6 +379,7 @@ mod tests {
             identity: None,
             passphrase: None,
             accept_new: false,
+            protocol: crate::crypto::DEFAULT_VERSION.to_string(),
             argv: vec![],
         };
         assert_eq!(o.host, "h");

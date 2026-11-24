@@ -60,14 +60,13 @@ pub fn home_dir() -> Option<PathBuf> {
     getpwuid(euid).map(|p| PathBuf::from(p.home))
 }
 
-/// `$XDG_CONFIG_HOME` or `$HOME/.config`.
-pub fn config_dir() -> crate::error::Result<PathBuf> {
-    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(x));
-    }
+/// The saltsh state directory: `$HOME/.saltsh`. All of saltsh's user-level
+/// files live here (identity keys, known_hosts, per-user authorized_keys,
+/// and the non-root host key) — the ssh-style single-directory layout.
+pub fn saltsh_dir() -> crate::error::Result<PathBuf> {
     home_dir()
-        .map(|h| h.join(".config"))
-        .ok_or_else(|| crate::error::Error::usage("cannot determine config directory (no $HOME)"))
+        .map(|h| h.join(".saltsh"))
+        .ok_or_else(|| crate::error::Error::usage("cannot determine home directory (no $HOME)"))
 }
 
 /// The username to present when none is given (`$USER`, else passwd).
@@ -91,14 +90,13 @@ pub fn is_root() -> bool {
 }
 
 /// Default host-key path: `/etc/saltsh/host_key` as root,
-/// `~/.config/saltsh/host_key` otherwise.
+/// `~/.saltsh/host_key` otherwise.
 pub fn default_host_key_path() -> PathBuf {
     if is_root() {
         PathBuf::from("/etc/saltsh/host_key")
     } else {
-        config_dir()
-            .unwrap_or_else(|_| PathBuf::from(".config"))
-            .join("saltsh")
+        saltsh_dir()
+            .unwrap_or_else(|_| PathBuf::from(".saltsh"))
             .join("host_key")
     }
 }

@@ -81,6 +81,21 @@ is the recommended companion to `--daemonize`. With `--log-timestamps`,
 every line is prefixed with a local-time `[YYYY-MM-DD HH:MM:SS]` stamp
 (syslog style).
 
+### Session environment
+
+The server sheds its own inherited environment at startup (only `PATH`
+survives) and builds every session's environment explicitly, so nothing
+the server process knew — tokens, agent sockets, secrets — can leak into
+a client shell. A session sees exactly:
+
+```
+PATH=...      (inherited from the server's PATH)
+HOME=...      (the logged-in user's home directory, from /etc/passwd)
+USER=..., LOGNAME=..., SHELL=...
+TERM=...      (the client's terminal type)
+SSH_ORIGINAL_COMMAND=...   (only with a command= forced command)
+```
+
 ### Host key
 
 The host key authenticates the server to clients (clients pin it via TOFU,

@@ -939,6 +939,53 @@ fn server_log_timestamps() {
 }
 
 #[test]
+fn server_clears_env_and_sets_home() {
+    // The server must shed its own inherited environment and give every
+    // session an explicit identity: HOME/USER/LOGNAME/SHELL from passwd
+    // plus PATH and TERM — and nothing else. Poison the server's
+    // environment and verify none of it reaches the client shell.
+    let client_kp = sshkeys::generate_keypair();
+    let dir = TempDir::new("envclear");
+    let host_key = dir.0.join("host_key");
+    let authorized = dir.0.join("authorized_keys");
+    let host_kp = sshkeys::generate_keypair();
+    sshkeys::write_private_key_file(&host_key, &host_kp, "t").unwrap();
+    std::fs::write(&authorized, sshkeys::authorized_keys_entry(&client_kp.public, "c")).unwrap();
+    let (listener, port) = free_listener();
+    drop(listener);
+    let _srv = ServerProc(Some(
+        Command::new(bin())
+            .args(["serve", "--listen", "127.0.0.1", "--port", &port.to_string(), "--host-key"])
+            .arg(&host_key)
+            .arg("--authorized-keys")
+            .arg(&authorized)
+            .env("SECRET_TOKEN", "do-not-leak")
+            .env("SSH_AUTH_SOCK", "/tmp/fake-agent.sock")
+            .env("AWS_ACCESS_KEY_ID", "AKIALEAK")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    ));
+    assert!(wait_ready(port, Instant::now() + Duration::from_secs(10)));
+    let identity = write_client_key(&dir, &client_kp);
+    let me = util::getpwuid(unsafe { libc::geteuid() }).expect("passwd entry");
+
+    let (code, stdout) = run_client(port, &identity, &dir, &["/usr/bin/env"]);
+    assert_eq!(code, 0, "client failed");
+    let env_out = String::from_utf8_lossy(&stdout);
+    for leaked in ["SECRET_TOKEN", "SSH_AUTH_SOCK", "AWS_ACCESS_KEY_ID"] {
+        assert!(!env_out.contains(leaked), "{leaked} leaked into session: {env_out}");
+    }
+    assert!(env_out.contains(&format!("HOME={}", me.home)), "env: {env_out}");
+    assert!(env_out.contains(&format!("USER={}", me.name)), "env: {env_out}");
+    assert!(env_out.contains(&format!("LOGNAME={}", me.name)), "env: {env_out}");
+    assert!(env_out.contains("SHELL="), "env: {env_out}");
+    assert!(env_out.contains("PATH="), "env: {env_out}");
+    assert!(env_out.contains("TERM="), "env: {env_out}");
+}
+
+#[test]
 fn bidirectional_pty_roundtrip() {
     let client_kp = sshkeys::generate_keypair();
     let (port, dir) = start_server("bidi", &client_kp, true);

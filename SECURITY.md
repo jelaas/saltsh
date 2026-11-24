@@ -185,13 +185,17 @@ are enforced and unit-tested:
   child pid, and only before it has been reaped.
 * **No client-controlled environment variables — hard guarantee:** the
   server ignores the EXEC `env[]` field entirely (`..` destructuring) and
-  the saltsh client always sends it empty. Only two variables are ever set
-  in the session, neither from client env input: `TERM` (the terminal-type
-  protocol field) and `SSH_ORIGINAL_COMMAND` (the requested argv, set only
-  when the administrator's `authorized_keys` entry carries a forced
-  command). This supersedes the earlier blocklist fix (F-4) with a
-  structural guarantee: even a modified client cannot inject `PATH`,
-  `LD_PRELOAD`, or anything else.
+  the saltsh client always sends it empty. This supersedes the earlier
+  blocklist fix (F-4) with a structural guarantee: even a modified client
+  cannot inject `PATH`, `LD_PRELOAD`, or anything else.
+* **The server's own environment cannot leak either:** `run()` replaces the
+  inherited environment with PATH-only at startup (covered end-to-end by
+  `server_clears_env_and_sets_home`, which poisons the server env with
+  tokens and verifies none reach the session). Each session environment is
+  then built explicitly in the fork child: `HOME`/`USER`/`LOGNAME`/`SHELL`
+  from the passwd entry of the logged-in user, plus `TERM` (terminal-type
+  protocol field) and, for `command=` forced commands only,
+  `SSH_ORIGINAL_COMMAND` (the requested argv).
 * Username: length-capped, NUL-free, used only in `getpwnam` (no shell);
   log output is now sanitized of control characters — **fixed (F-5)** —
   preventing log-line forgery via embedded newlines/escapes.
@@ -199,9 +203,10 @@ are enforced and unit-tested:
 ### 3.4 Server: privilege drop (per-user mode)
 
 * `setgid → initgroups → setuid → chdir(home)` in the forked child, in the
-  correct order; any failure exits before exec. All argv CStrings and
-  pointer arrays are pre-built before `forkpty`, and the child only makes
-  async-signal-safe calls between fork and exec.
+  correct order; any failure exits before exec (shared-file mode runs as
+  the server's own identity and chdirs to its passwd home). All argv and
+  environment CStrings and pointer arrays are pre-built before `forkpty`,
+  and the child only makes async-signal-safe calls between fork and exec.
 * `getpwnam` static storage is protected by a mutex; fields are copied out
   immediately (thread-per-connection server).
 * The requested username is only ever matched against that user's own
@@ -288,7 +293,7 @@ are enforced and unit-tested:
 
 ## 6. Testing
 
-* 39 unit tests + 28 integration tests (67 total), including: tamper
+* 39 unit tests + 29 integration tests (68 total), including: tamper
   detection, framing round-trips, malformed-message rejection,
   client-cannot-set-env, log sanitization, low-order-point rejection (both
   directions), silent-until-valid handshake, custom protocol identifiers,

@@ -30,8 +30,36 @@ use crate::util;
 use crate::util::Passwd;
 use crate::wire;
 
+/// Replace the server's inherited environment with a minimal one: PATH
+/// only (with a sane default if it was absent). The server must never pass
+/// its own environment — tokens, agent sockets, secrets — into client
+/// sessions. Runs in `run()` (the real binary) only; `run_on` (tests)
+/// deliberately leaves the process environment alone.
+fn clear_environment() {
+    // std::env::vars() yields a snapshot, so unsetting while iterating the
+    // snapshot is safe.
+    let path = std::env::var("PATH").ok();
+    for (name, _) in std::env::vars() {
+        if name != "PATH" {
+            let name_c = CString::new(name.as_str()).unwrap_or_default();
+            unsafe { libc::unsetenv(name_c.as_ptr()) };
+        }
+    }
+    if path.is_none() {
+        unsafe {
+            libc::setenv(
+                c"PATH".as_ptr(),
+                c"/usr/local/bin:/usr/bin:/bin".as_ptr(),
+                1,
+            );
+        }
+    }
+}
+
 /// Listen forever, spawning a thread per connection.
 pub fn run(opts: ServerOpts) -> Result<()> {
+    // Shed the inherited environment before anything else runs.
+    clear_environment();
     // --log-timestamps: applies to every server log line from here on.
     if opts.log_timestamps {
         crate::logger::enable_timestamps();
@@ -245,6 +273,18 @@ fn handle_conn(stream: TcpStream, sk: &SigningKey, opts: &ServerOpts) -> Result<
         RunAs::User(pw) if !pw.shell.is_empty() => pw.shell.clone(),
         _ => util::default_shell(),
     };
+    // Session identity: HOME/USER/LOGNAME/SHELL for the logged-in user.
+    // In per-user mode that's the passwd entry; in shared-file mode it's
+    // the server's own identity. The child gets ONLY these plus PATH,
+    // TERM, and (for forced commands) SSH_ORIGINAL_COMMAND — the server
+    // cleared its own environment at startup, so nothing else can leak.
+    let (session_name, session_home) = match &run_as {
+        RunAs::User(pw) => (pw.name.clone(), pw.home.clone()),
+        RunAs::CurrentUser => match util::getpwuid(unsafe { libc::geteuid() }) {
+            Some(pw) => (pw.name, pw.home),
+            None => (util::default_username(), "/".to_string()),
+        },
+    };
     // A `command="..."` forced command overrides the requested argv: the
     // forced command is split into its base elements, and the client's argv
     // is appended *as-is* (each element one argument — no shell joining or
@@ -285,13 +325,12 @@ fn handle_conn(stream: TcpStream, sk: &SigningKey, opts: &ServerOpts) -> Result<
     arg_ptrs.push(std::ptr::null());
     let term_c =
         CString::new(term.as_str()).unwrap_or_else(|_| CString::new("xterm").unwrap());
-    let (pw_name_c, pw_home_c, pw_ids) = match &run_as {
-        RunAs::User(pw) => (
-            Some(CString::new(pw.name.clone()).unwrap_or_default()),
-            Some(CString::new(pw.home.clone()).unwrap_or_default()),
-            Some((pw.uid, pw.gid)),
-        ),
-        RunAs::CurrentUser => (None, None, None),
+    let home_c = CString::new(session_home.as_str()).unwrap_or_default();
+    let name_c = CString::new(session_name.as_str()).unwrap_or_default();
+    let shell_c = CString::new(shell.as_str()).unwrap_or_default();
+    let pw_ids = match &run_as {
+        RunAs::User(pw) => Some((pw.uid, pw.gid)),
+        RunAs::CurrentUser => None,
     };
 
     // --- forkpty: child is the session leader with the pty as controlling
@@ -310,8 +349,9 @@ fn handle_conn(stream: TcpStream, sk: &SigningKey, opts: &ServerOpts) -> Result<
             arg_cs: &arg_cs,
             arg_ptrs: &arg_ptrs,
             term_c: &term_c,
-            pw_name_c: &pw_name_c,
-            pw_home_c: &pw_home_c,
+            home_c: &home_c,
+            name_c: &name_c,
+            shell_c: &shell_c,
             pw_ids,
             ssh_original: orig_c.as_ref(),
         };
@@ -332,22 +372,33 @@ struct ChildParams<'a> {
     arg_cs: &'a [CString],
     arg_ptrs: &'a [*const c_char],
     term_c: &'a CString,
-    pw_name_c: &'a Option<CString>,
-    pw_home_c: &'a Option<CString>,
+    home_c: &'a CString,
+    name_c: &'a CString,
+    shell_c: &'a CString,
     pw_ids: Option<(u32, u32)>,
     ssh_original: Option<&'a CString>,
 }
 
-/// The child side of forkpty: set env, drop privileges, execvp. Never
-/// returns; uses only async-signal-safe calls (everything is pre-built).
+/// The child side of forkpty: build the session environment, drop
+/// privileges, execvp. Never returns; uses only async-signal-safe calls
+/// (everything is pre-built).
+///
+/// Environment: the server shed its own environment at startup, so the
+/// child inherits only PATH. Everything else is set here, from values the
+/// server derived itself (passwd entries, the TERM protocol field, the
+/// argv mirror for forced commands) — nothing client-controlled beyond
+/// TERM, and nothing inherited from the server's original environment.
 fn child_side(p: &ChildParams<'_>) -> ! {
     unsafe {
-        // Only two environment variables are ever set, and neither takes
-        // its value from client-controlled env input: TERM (dedicated
-        // terminal-type protocol field) and SSH_ORIGINAL_COMMAND (the
-        // requested argv, set only when the administrator's authorized_keys
-        // entry carries a forced command).
+        // Identity of the logged-in user.
+        libc::setenv(c"HOME".as_ptr(), p.home_c.as_ptr(), 1);
+        libc::setenv(c"USER".as_ptr(), p.name_c.as_ptr(), 1);
+        libc::setenv(c"LOGNAME".as_ptr(), p.name_c.as_ptr(), 1);
+        libc::setenv(c"SHELL".as_ptr(), p.shell_c.as_ptr(), 1);
+        // Terminal type (dedicated protocol field).
         libc::setenv(c"TERM".as_ptr(), p.term_c.as_ptr(), 1);
+        // Requested argv, set only when the administrator's authorized_keys
+        // entry carries a forced command.
         if let Some(orig) = p.ssh_original {
             libc::setenv(c"SSH_ORIGINAL_COMMAND".as_ptr(), orig.as_ptr(), 1);
         }
@@ -356,17 +407,13 @@ fn child_side(p: &ChildParams<'_>) -> ! {
                 libc::write(2, c"saltsh: setgid failed\n".as_ptr() as *const libc::c_void, 25);
                 libc::_exit(1);
             }
-            if let Some(name) = p.pw_name_c {
-                libc::initgroups(name.as_ptr(), gid);
-            }
+            libc::initgroups(p.name_c.as_ptr(), gid);
             if libc::setuid(uid) != 0 {
                 libc::write(2, c"saltsh: setuid failed\n".as_ptr() as *const libc::c_void, 25);
                 libc::_exit(1);
             }
-            if let Some(home) = p.pw_home_c {
-                libc::chdir(home.as_ptr());
-            }
         }
+        libc::chdir(p.home_c.as_ptr());
         libc::execvp(p.arg_cs[0].as_ptr(), p.arg_ptrs.as_ptr());
         // exec failed
         libc::write(2, c"saltsh: exec failed\n".as_ptr() as *const libc::c_void, 20);

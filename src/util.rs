@@ -80,9 +80,19 @@ pub fn default_username() -> String {
     getpwuid(euid).map(|p| p.name).unwrap_or_else(|| "user".into())
 }
 
-/// The local login shell (`$SHELL`, else `/bin/sh`).
+/// The local login shell: `$SHELL`, else the passwd entry, else `/bin/sh`.
+/// (The server clears its environment, so the passwd fallback matters.)
 pub fn default_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+    if let Ok(s) = std::env::var("SHELL") {
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    let euid = unsafe { libc::geteuid() };
+    getpwuid(euid)
+        .map(|p| p.shell)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/bin/sh".into())
 }
 
 pub fn is_root() -> bool {

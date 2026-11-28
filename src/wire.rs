@@ -175,6 +175,38 @@ pub fn set_handshake_timeout(stream: &TcpStream) -> std::io::Result<()> {
     stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))
 }
 
+/// A reader that enforces one absolute deadline across *all* reads.
+///
+/// A plain socket read timeout restarts on every successful read, so a
+/// peer trickling one byte per (timeout - 1) seconds could hold a server
+/// thread for hours. Here each read gets only the time remaining until
+/// `deadline`, and fails with `TimedOut` once it has passed.
+pub struct DeadlineReader<'a> {
+    stream: &'a TcpStream,
+    deadline: std::time::Instant,
+}
+
+impl<'a> DeadlineReader<'a> {
+    pub fn new(stream: &'a TcpStream, deadline: std::time::Instant) -> Self {
+        DeadlineReader { stream, deadline }
+    }
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self
+            .deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "login grace time exceeded")
+            })?;
+        self.stream.set_read_timeout(Some(left))?;
+        let mut s = self.stream;
+        s.read(buf)
+    }
+}
+
 /// Remove the socket timeouts before the session phase.
 pub fn clear_timeouts(stream: &TcpStream) -> std::io::Result<()> {
     stream.set_read_timeout(None)?;

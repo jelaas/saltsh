@@ -41,6 +41,35 @@ pub fn getpwuid(uid: u32) -> Option<Passwd> {
     }
 }
 
+/// The complete supplementary group list of `name` (including `gid`),
+/// sized dynamically. Computed in the parent before forking so the child
+/// can install it with one checked `setgroups` call.
+///
+/// This replaces `initgroups(3)` in the child, whose failure was ignored:
+/// musl's `initgroups` uses a fixed 32-entry buffer and fails *without
+/// calling setgroups* for users in more groups, so the session silently
+/// kept the server's (root's) supplementary groups.
+pub fn supplementary_groups(name: &str, gid: u32) -> Option<Vec<libc::gid_t>> {
+    let _guard = PW_LOCK.lock().unwrap();
+    let cname = CString::new(name).ok()?;
+    let mut cap: libc::c_int = 64;
+    for _ in 0..8 {
+        let mut buf = vec![0 as libc::gid_t; cap as usize];
+        let mut count = cap;
+        let r = unsafe { libc::getgrouplist(cname.as_ptr(), gid, buf.as_mut_ptr(), &mut count) };
+        if r >= 0 && count >= 0 && count <= cap {
+            buf.truncate(count as usize);
+            return Some(buf);
+        }
+        // Too small: glibc and musl both report the required size.
+        cap = if count > cap { count } else { cap.saturating_mul(2) };
+        if cap > 65536 {
+            return None; // more than the kernel's NGROUPS_MAX
+        }
+    }
+    None
+}
+
 unsafe fn copy_passwd(p: &libc::passwd) -> Passwd {
     Passwd {
         name: CStr::from_ptr(p.pw_name).to_string_lossy().into_owned(),

@@ -14,6 +14,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use saltsh::cli::ServerOpts;
+use saltsh::msg::Msg;
 use saltsh::sshkeys::{self, KeyPair};
 use saltsh::util;
 
@@ -83,6 +84,17 @@ fn kill_works() -> bool {
 /// exercises the per-user `~user/.saltsh/authorized_keys` lookup path (requires
 /// root; the test skips itself otherwise).
 fn start_server_with(tag: &str, authorized_keys_content: &str, shared: bool) -> (u16, TempDir) {
+    start_server_tweaked(tag, authorized_keys_content, shared, |_, _| {})
+}
+
+/// Like [`start_server_with`], with a hook to adjust the options (it also
+/// gets the test directory, for creating custom files).
+fn start_server_tweaked(
+    tag: &str,
+    authorized_keys_content: &str,
+    shared: bool,
+    tweak: impl FnOnce(&mut ServerOpts, &Path),
+) -> (u16, TempDir) {
     let dir = TempDir::new(tag);
     let host_key = dir.0.join("host_key");
     let authorized = dir.0.join("authorized_keys");
@@ -91,32 +103,18 @@ fn start_server_with(tag: &str, authorized_keys_content: &str, shared: bool) -> 
     sshkeys::write_private_key_file(&host_key, &host_kp, "test host").unwrap();
 
     let (listener, port) = free_listener();
-    let opts = if shared {
-        std::fs::write(&authorized, authorized_keys_content).unwrap();
-        ServerOpts {
-            listen: "127.0.0.1".to_string(),
-            port,
-            host_key_path: Some(host_key),
-            authorized_keys_path: Some(authorized),
-            daemonize: false,
-            pidfile: None,
-            protocol: saltsh::crypto::DEFAULT_VERSION.to_string(),
-            log_file: None,
-            log_timestamps: false,
-        }
-    } else {
-        ServerOpts {
-            listen: "127.0.0.1".to_string(),
-            port,
-            host_key_path: Some(host_key),
-            authorized_keys_path: None,
-            daemonize: false,
-            pidfile: None,
-            protocol: saltsh::crypto::DEFAULT_VERSION.to_string(),
-            log_file: None,
-            log_timestamps: false,
-        }
+    let mut opts = ServerOpts {
+        listen: "127.0.0.1".to_string(),
+        port,
+        host_key_path: Some(host_key),
+        authorized_keys_path: None,
+        ..ServerOpts::default()
     };
+    if shared {
+        std::fs::write(&authorized, authorized_keys_content).unwrap();
+        opts.authorized_keys_path = Some(authorized);
+    }
+    tweak(&mut opts, &dir.0);
     std::thread::spawn(move || {
         let _ = saltsh::server::run_on(listener, opts);
     });
@@ -173,6 +171,72 @@ fn write_client_key(dir: &TempDir, kp: &KeyPair) -> PathBuf {
     let path = dir.0.join("id_ed25519");
     sshkeys::write_private_key_file(&path, kp, "test client").unwrap();
     path
+}
+
+/// A minimal protocol client assembled from the library, for tests that
+/// need control the real client binary does not offer: inspect raw auth
+/// replies, or vanish mid-session without a clean shutdown.
+struct RawClient {
+    stream: TcpStream,
+    sb: saltsh::crypto::SealBox,
+    ob: saltsh::crypto::OpenBox,
+    sid: [u8; 32],
+}
+
+impl RawClient {
+    fn connect(port: u16) -> RawClient {
+        use x25519_dalek::{EphemeralSecret, PublicKey};
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let v = saltsh::crypto::version_line(saltsh::crypto::DEFAULT_VERSION);
+        s.write_all(&v).unwrap();
+        let mut ver = vec![0u8; v.len()];
+        s.read_exact(&mut ver).unwrap();
+        assert_eq!(ver, v);
+        let eph = EphemeralSecret::random_from_rng(&mut saltsh::rng::os_rng());
+        let eph_pub = PublicKey::from(&eph);
+        s.write_all(eph_pub.as_bytes()).unwrap();
+        let mut kex = [0u8; 128];
+        s.read_exact(&mut kex).unwrap();
+        let server_eph: [u8; 32] = kex[..32].try_into().unwrap();
+        let shared = eph.diffie_hellman(&PublicKey::from(server_eph));
+        let sid = saltsh::crypto::session_id(&v, &v, eph_pub.as_bytes(), &server_eph, shared.as_bytes());
+        let (c2s, s2c) = saltsh::crypto::derive_keys(&sid, shared.as_bytes()).unwrap();
+        RawClient {
+            stream: s,
+            sb: saltsh::crypto::SealBox::new(&c2s),
+            ob: saltsh::crypto::OpenBox::new(&s2c),
+            sid,
+        }
+    }
+
+    fn send(&mut self, m: &Msg) {
+        assert!(saltsh::wire::send_packet(&mut self.stream, &mut self.sb, &m.encode()).unwrap());
+    }
+
+    /// Next message, or None once the server closed the connection.
+    fn recv(&mut self) -> Option<Msg> {
+        saltsh::wire::recv_packet(&mut self.stream, &mut self.ob)
+            .ok()
+            .flatten()
+            .map(|p| Msg::decode(&p).unwrap())
+    }
+
+    /// Full challenge/response as `user` with `kp`; returns the final reply
+    /// (None if the server closed the connection at any point).
+    fn login(&mut self, user: &str, kp: &KeyPair) -> Option<Msg> {
+        use ed25519_dalek::Signer;
+        let blob = sshkeys::ssh_ed25519_pubkey_blob(&kp.public);
+        self.send(&Msg::AuthReq { username: user.into(), pubkey_blob: blob.clone() });
+        let Msg::AuthChallenge { nonce } = self.recv()? else {
+            return None;
+        };
+        let sig = kp
+            .signing_key()
+            .sign(&saltsh::msg::user_auth_message(&self.sid, user, &blob, &nonce));
+        self.send(&Msg::AuthSig { signature: sig.to_bytes().to_vec() });
+        self.recv()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -636,7 +700,7 @@ fn daemonize_reports_bind_errors() {
         .unwrap();
     assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("Address in use"),
+        String::from_utf8_lossy(&out.stderr).contains("in use"),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -812,11 +876,8 @@ fn custom_protocol_identifier() {
         port,
         host_key_path: Some(host_key),
         authorized_keys_path: Some(authorized),
-        daemonize: false,
-        pidfile: None,
         protocol: "MYSECRET/1".to_string(),
-        log_file: None,
-        log_timestamps: false,
+        ..ServerOpts::default()
     };
     std::thread::spawn(move || {
         let _ = saltsh::server::run_on(listener, opts);
@@ -982,7 +1043,9 @@ fn server_clears_env_and_sets_home() {
     assert!(env_out.contains(&format!("LOGNAME={}", me.name)), "env: {env_out}");
     assert!(env_out.contains("SHELL="), "env: {env_out}");
     assert!(env_out.contains("PATH="), "env: {env_out}");
-    assert!(env_out.contains("TERM="), "env: {env_out}");
+    // a command runs without a terminal, so (like sshd) no TERM either —
+    // see pty_only_when_requested for the terminal case
+    assert!(!env_out.contains("TERM="), "env: {env_out}");
 }
 
 #[test]
@@ -1006,11 +1069,7 @@ fn hostkey_preseed_skips_tofu() {
         port,
         host_key_path: Some(host_key.clone()),
         authorized_keys_path: Some(authorized),
-        daemonize: false,
-        pidfile: None,
-        protocol: saltsh::crypto::DEFAULT_VERSION.to_string(),
-        log_file: None,
-        log_timestamps: false,
+        ..ServerOpts::default()
     };
     std::thread::spawn(move || {
         let _ = saltsh::server::run_on(listener, opts);
@@ -1080,11 +1139,8 @@ fn client_config_protocol_per_host() {
         port,
         host_key_path: Some(host_key),
         authorized_keys_path: Some(authorized),
-        daemonize: false,
-        pidfile: None,
         protocol: "MYSECRET/1".to_string(),
-        log_file: None,
-        log_timestamps: false,
+        ..ServerOpts::default()
     };
     std::thread::spawn(move || {
         let _ = saltsh::server::run_on(listener, opts);
@@ -1143,6 +1199,7 @@ fn bidirectional_pty_roundtrip() {
     let n = payload.len();
     let mut child = client_cmd(port, &identity, &dir, "127.0.0.1");
     let mut child = child
+        .arg("-t") // a command gets a terminal only on request
         .arg("--")
         .arg("/bin/sh")
         .arg("-c")
@@ -1228,4 +1285,606 @@ fn interop_with_ssh_keygen() {
     let y_out = String::from_utf8_lossy(&st.stdout);
     let parsed = sshkeys::parse_authorized_keys_line(&y_out).unwrap();
     assert_eq!(parsed.public, ours.public);
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the 2026-11-28 audit findings
+
+/// The descriptor targets a session process holds: `ls` lists its own
+/// fds (everything it inherited, plus its handle on the directory, which
+/// is filtered out). Reading /proc/self avoids needing ptrace access to
+/// another process's fd table, which some sandboxes deny.
+fn session_fd_targets(port: u16, identity: &Path, dir: &TempDir) -> Vec<String> {
+    let out = client_cmd(port, identity, dir, "127.0.0.1")
+        .args(["-t", "--", "/bin/ls", "-l", "/proc/self/fd/"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "listing failed");
+    let out = out.stdout;
+    String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|l| l.split_once(" -> ").map(|(_, t)| t.trim().to_string()))
+        .filter(|t| !t.starts_with("/proc/"))
+        .collect()
+}
+
+#[test]
+fn sessions_do_not_inherit_descriptors() {
+    // Finding 1: PTY masters were opened without close-on-exec, so every
+    // session inherited the terminals of all other live sessions (and could
+    // read and type into them). A session may hold nothing but its own pty.
+    let client_kp = sshkeys::generate_keypair();
+    let (port, dir) = start_server("nofdleak", &client_kp, true);
+    let identity = write_client_key(&dir, &client_kp);
+
+    // session A stays alive while session B looks at its descriptors
+    let mut a = client_cmd(port, &identity, &dir, "127.0.0.1");
+    let mut a = a
+        .args(["-t", "--", "/bin/sleep", "3"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(800));
+    let targets = session_fd_targets(port, &identity, &dir);
+    let _ = a.wait();
+    assert!(!targets.is_empty());
+    for t in &targets {
+        assert!(
+            t.starts_with("/dev/pts/"),
+            "session inherited a foreign descriptor: {t} (all: {targets:?})"
+        );
+    }
+}
+
+#[test]
+fn server_closes_pty_masters_after_sessions() {
+    // Finding 6: the master was never closed when a session ended
+    // normally, leaking one descriptor per session. Uses a separate server
+    // process so its fd table can be inspected in isolation.
+    let client_kp = sshkeys::generate_keypair();
+    let dir = TempDir::new("masterleak");
+    let host_key = dir.0.join("host_key");
+    let authorized = dir.0.join("authorized_keys");
+    sshkeys::write_private_key_file(&host_key, &sshkeys::generate_keypair(), "t").unwrap();
+    std::fs::write(&authorized, sshkeys::authorized_keys_entry(&client_kp.public, "c")).unwrap();
+    let (listener, port) = free_listener();
+    drop(listener);
+    let child = Command::new(bin())
+        .args(["serve", "--listen", "127.0.0.1", "--port", &port.to_string(), "--host-key"])
+        .arg(&host_key)
+        .arg("--authorized-keys")
+        .arg(&authorized)
+        // never share the harness's stdio: a server outliving the test
+        // (kill(2) is denied in some sandboxes) would hold it open
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let server_pid = child.id();
+    let _guard = ServerProc(Some(child));
+    assert!(wait_ready(port, Instant::now() + Duration::from_secs(10)));
+    let identity = write_client_key(&dir, &client_kp);
+    for _ in 0..3 {
+        let (code, _) = run_client(port, &identity, &dir, &["/bin/true"]);
+        assert_eq!(code, 0);
+    }
+    let ptys_open = || {
+        std::fs::read_dir(format!("/proc/{server_pid}/fd"))
+            .unwrap()
+            .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+            .filter(|t| t.to_string_lossy().contains("ptmx"))
+            .count()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while ptys_open() > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(ptys_open(), 0, "server still holds pty masters of finished sessions");
+}
+
+/// Start a session whose main process prints its pid and sleeps, vanish
+/// without any shutdown message, and require the process to be gone (hung
+/// up AND reaped, not a zombie) shortly after.
+fn assert_hangup_reaps(
+    tag: &str,
+    authorized_line: &str,
+    argv: Vec<String>,
+    pty: bool,
+    client_kp: &KeyPair,
+) {
+    let (port, _dir) = start_server_with(tag, authorized_line, true);
+    let mut c = RawClient::connect(port);
+    assert_eq!(c.login("anyone", client_kp), Some(Msg::AuthOk));
+    c.send(&Msg::Exec { argv, term: "dumb".into(), rows: 24, cols: 80, pty, env: vec![] });
+    assert_eq!(c.recv(), Some(Msg::ExecOk { pty }));
+    let mut seen = Vec::new();
+    let pid = loop {
+        match c.recv() {
+            Some(Msg::PtyData(d)) => seen.extend_from_slice(&d),
+            other => panic!("session ended early: {other:?}"),
+        }
+        let text = String::from_utf8_lossy(&seen);
+        if let Some(rest) = text.split("PID=").nth(1) {
+            if let Some(n) = rest.split(|ch: char| !ch.is_ascii_digit()).next().filter(|n| rest.len() > n.len()) {
+                break n.parse::<u32>().unwrap();
+            }
+        }
+    };
+    let proc_path = PathBuf::from(format!("/proc/{pid}"));
+    assert!(proc_path.exists());
+    drop(c); // vanish without any shutdown message
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while proc_path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let state = std::fs::read_to_string(proc_path.join("stat")).unwrap_or_default();
+    assert!(!proc_path.exists(), "session pid {pid} still present (stat: {state})");
+}
+
+#[test]
+fn hangup_kills_and_reaps_the_session() {
+    // Finding 6: a client that vanished left its session process unreaped
+    // (a zombie per connection). The session must get SIGHUP and be reaped.
+    let client_kp = sshkeys::generate_keypair();
+    let line = sshkeys::authorized_keys_entry(&client_kp.public, "c");
+    let argv = vec!["/bin/sh".into(), "-c".into(), "echo PID=$$; exec /bin/sleep 30".into()];
+    assert_hangup_reaps("hangup", &line, argv.clone(), true, &client_kp);
+    // the same without a terminal: closing the pipes plus SIGHUP
+    if can_signal_children() {
+        assert_hangup_reaps("hangup-pipes", &line, argv, false, &client_kp);
+    }
+}
+
+/// Whether this process may deliver real signals to other processes.
+/// Some sandboxes allow `kill(pid, 0)` but refuse every actual signal, so
+/// probe with one.
+fn can_signal_children() -> bool {
+    let Ok(mut child) = Command::new("/bin/cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let ok = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) } == 0;
+    drop(child.stdin.take()); // lets cat exit if the signal was refused
+    let _ = child.wait();
+    ok
+}
+
+#[test]
+fn hangup_closes_a_forced_commands_pipes_and_reaps_it() {
+    // A forced command runs on pipes. When its client vanishes, its stdin
+    // is closed (EOF) — so a command waiting for input ends — and it is
+    // reaped. (Independent of signal delivery.)
+    let client_kp = sshkeys::generate_keypair();
+    let entry = sshkeys::authorized_keys_entry(&client_kp.public, "c");
+    let line = format!("command=\"/bin/sh -c\" {}", entry.trim_end());
+    let argv = vec!["echo PID=$$; exec /bin/cat >/dev/null".into()];
+    assert_hangup_reaps("hangup-forced-eof", &line, argv, false, &client_kp);
+}
+
+#[test]
+fn hangup_signals_a_forced_command() {
+    // ...and a forced command that ignores its stdin still gets SIGHUP:
+    // it is its own process group, like a PTY session. (Pipe sessions have
+    // no terminal for the kernel to hang up, so this relies on kill(2).)
+    if !can_signal_children() {
+        eprintln!("signals to other processes are denied here; skipping");
+        return;
+    }
+    let client_kp = sshkeys::generate_keypair();
+    let entry = sshkeys::authorized_keys_entry(&client_kp.public, "c");
+    let line = format!("command=\"/bin/sh -c\" {}", entry.trim_end());
+    let argv = vec!["echo PID=$$; exec /bin/sleep 30".into()];
+    assert_hangup_reaps("hangup-forced-sig", &line, argv, false, &client_kp);
+}
+
+#[test]
+fn login_grace_time_is_a_total_deadline() {
+    // Finding 7: the handshake timeout restarted on every read, so a peer
+    // trickling bytes could hold a server thread indefinitely.
+    let (port, _dir) = start_server_tweaked("grace", "", true, |o, _| {
+        o.login_grace_time = Duration::from_secs(2);
+    });
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
+    let start = Instant::now();
+    let mut closed_after = None;
+    let mut buf = [0u8; 16];
+    // one byte per ~400 ms: always "active", never finished
+    for &b in b"SALTSH/1SALTSH/1" {
+        if s.write_all(&[b]).is_err() {
+            closed_after = Some(start.elapsed());
+            break;
+        }
+        match s.read(&mut buf) {
+            Ok(0) => {
+                closed_after = Some(start.elapsed());
+                break;
+            }
+            Ok(_) => panic!("unexpected data before the version line was complete"),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(_) => {
+                closed_after = Some(start.elapsed());
+                break;
+            }
+        }
+    }
+    let t = closed_after.expect("server kept a trickling connection open past the grace time");
+    assert!(t >= Duration::from_millis(1500) && t < Duration::from_secs(4), "closed after {t:?}");
+}
+
+#[test]
+fn per_source_startup_limit_drops_excess_connections() {
+    // Finding 7: no cap on unauthenticated connections (thread/fd
+    // exhaustion). Excess connections from one source are closed at once.
+    let (port, _dir) = start_server_tweaked("startups", "", true, |o, _| {
+        o.per_source_max_startups = 2;
+    });
+    // let wait_ready()'s probe connection release its slot first
+    std::thread::sleep(Duration::from_millis(300));
+    let idle1 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let _idle2 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let is_closed = |s: &mut TcpStream| {
+        s.set_read_timeout(Some(Duration::from_millis(700))).unwrap();
+        let mut b = [0u8; 1];
+        match s.read(&mut b) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(e) => !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut),
+        }
+    };
+    let mut third = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert!(is_closed(&mut third), "third concurrent unauthenticated connection must be dropped");
+    drop(idle1);
+    std::thread::sleep(Duration::from_millis(300));
+    let mut fourth = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert!(!is_closed(&mut fourth), "a freed slot must admit the next connection");
+}
+
+#[test]
+fn auth_replies_do_not_reveal_users_or_keys() {
+    // Finding 9: unknown users got the connection closed, known users an
+    // AUTH_FAIL, and authorized public keys an AUTH_CHALLENGE — an oracle
+    // for both. Now every request is challenged and fails the same way.
+    let authorized_kp = sshkeys::generate_keypair();
+    let other_kp = sshkeys::generate_keypair();
+    let (port, _dir) = start_server("oracle", &authorized_kp, false);
+    for (user, kp) in [
+        ("saltsh-no-such-user-98765", &other_kp),   // unknown user
+        ("saltsh-no-such-user-98765", &authorized_kp),
+    ] {
+        let mut c = RawClient::connect(port);
+        assert_eq!(c.login(user, kp), Some(Msg::AuthFail), "user {user}");
+    }
+    let (port, _dir) = start_server("oracle2", &authorized_kp, true);
+    let mut c = RawClient::connect(port);
+    // unauthorized key: challenged too, then refused
+    assert_eq!(c.login("anyone", &other_kp), Some(Msg::AuthFail));
+}
+
+#[test]
+fn uppercase_option_names_are_enforced() {
+    // Finding 4: option names were matched case-sensitively, so an
+    // OpenSSH-valid `COMMAND="..."` was ignored and the key unrestricted.
+    let client_kp = sshkeys::generate_keypair();
+    let entry = sshkeys::authorized_keys_entry(&client_kp.public, "c");
+    let line = format!("COMMAND=\"/bin/echo restricted\" {}", entry.trim_end());
+    let (port, dir) = start_server_with("upper", &line, true);
+    let identity = write_client_key(&dir, &client_kp);
+    let (code, stdout) = run_client(port, &identity, &dir, &["/bin/echo", "free"]);
+    assert_eq!(code, 0);
+    let out = String::from_utf8_lossy(&stdout);
+    assert!(out.trim().starts_with("restricted"), "forced command not applied: {out:?}");
+}
+
+#[test]
+fn unknown_option_refuses_the_key() {
+    // Finding 4: unknown (e.g. misspelled) options were skipped, keeping
+    // the key but dropping the restriction. Now the whole line is refused.
+    let client_kp = sshkeys::generate_keypair();
+    let entry = sshkeys::authorized_keys_entry(&client_kp.public, "c");
+    let line = format!("frm=\"10.9.9.9\" {}", entry.trim_end());
+    let (port, dir) = start_server_with("unknownopt", &line, true);
+    let identity = write_client_key(&dir, &client_kp);
+    let (code, _) = run_client(port, &identity, &dir, &["/bin/true"]);
+    assert_ne!(code, 0);
+}
+
+#[test]
+fn hostile_authorized_keys_paths_are_refused_quickly() {
+    // Finding 8: the file was read with no size limit, following symlinks
+    // to devices: `-> /dev/zero` made the server allocate until it died.
+    let client_kp = sshkeys::generate_keypair();
+    let (port, dir) = start_server_tweaked("devzero", "", true, |o, d| {
+        let link = d.join("ak-zero");
+        std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
+        o.authorized_keys_path = Some(link);
+    });
+    let identity = write_client_key(&dir, &client_kp);
+    let start = Instant::now();
+    let (code, _) = run_client(port, &identity, &dir, &["/bin/true"]);
+    assert_ne!(code, 0);
+    assert!(start.elapsed() < Duration::from_secs(10));
+    // ...and the server is still alive
+    assert!(wait_ready(port, Instant::now() + Duration::from_secs(2)));
+}
+
+#[test]
+fn tofu_pins_only_after_a_valid_signature() {
+    // Finding 9: on first contact the key was written to known_hosts
+    // before the server proved possession of it, so a garbage signature
+    // still left a permanent (and wrong) pin behind.
+    use x25519_dalek::{EphemeralSecret, PublicKey};
+    let (listener, port) = free_listener();
+    std::thread::spawn(move || {
+        if let Ok((mut s, _)) = listener.accept() {
+            let _ = s.write_all(b"SALTSH/1\n");
+            let mut ver = [0u8; 9];
+            let _ = s.read_exact(&mut ver);
+            let mut eph = [0u8; 32];
+            let _ = s.read_exact(&mut eph);
+            let mine = EphemeralSecret::random_from_rng(&mut saltsh::rng::os_rng());
+            let mut reply = PublicKey::from(&mine).as_bytes().to_vec();
+            reply.extend_from_slice(&sshkeys::generate_keypair().public); // valid point
+            reply.extend_from_slice(&[0x11; 64]); // but no valid signature
+            let _ = s.write_all(&reply);
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    });
+    let dir = TempDir::new("tofu-sig");
+    let identity = write_client_key(&dir, &sshkeys::generate_keypair());
+    let out = client_cmd(port, &identity, &dir, "127.0.0.1")
+        .arg("--")
+        .arg("/bin/true")
+        .output()
+        .unwrap();
+    assert_ne!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("signature verification failed"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pins = std::fs::read_to_string(dir.0.join(".saltsh/known_hosts")).unwrap_or_default();
+    assert!(!pins.contains(&format!("127.0.0.1:{port}")), "bad key was pinned: {pins}");
+}
+
+#[test]
+fn per_user_commands_run_through_login_shell_with_exact_argv() {
+    // Finding 2: per-user sessions now go through the account's login
+    // shell (so nologin/restricted shells are enforced); for a POSIX shell
+    // the argv must still arrive exactly as sent.
+    let _guard = PER_USER_LOCK.lock().unwrap();
+    if !util::is_root() {
+        eprintln!("per-user mode requires root; skipping");
+        return;
+    }
+    let client_kp = sshkeys::generate_keypair();
+    let home = util::home_dir().expect("HOME");
+    let saltsh_dir = home.join(".saltsh");
+    let ak = saltsh_dir.join("authorized_keys");
+    let original = std::fs::read(&ak).ok();
+    std::fs::create_dir_all(&saltsh_dir).unwrap();
+    std::fs::write(&ak, sshkeys::authorized_keys_entry(&client_kp.public, "saltsh-test")).unwrap();
+
+    let (port, dir) = start_server("loginshell", &client_kp, false);
+    let identity = write_client_key(&dir, &client_kp);
+    let (code, stdout) = run_client(
+        port,
+        &identity,
+        &dir,
+        &["/bin/sh", "-c", "printf '%s|' \"$@\"", "x", "a b", "", "c'd", "$HOME"],
+    );
+    match original {
+        Some(data) => std::fs::write(&ak, data).unwrap(),
+        None => {
+            let _ = std::fs::remove_file(&ak);
+        }
+    }
+    assert_eq!(code, 0);
+    assert_eq!(String::from_utf8_lossy(&stdout), "a b||c'd|$HOME|");
+}
+
+#[test]
+fn forced_command_runs_without_a_pty_and_is_binary_clean() {
+    // Forced commands run on plain pipes: no terminal (so no TERM), and the
+    // output arrives byte for byte — no \n -> \r\n rewriting, NUL and
+    // control bytes intact. Ordinary commands keep their PTY.
+    let client_kp = sshkeys::generate_keypair();
+    let entry = sshkeys::authorized_keys_entry(&client_kp.public, "c");
+    let line = format!("command=\"/bin/sh -c\" {}", entry.trim_end());
+    let (port, dir) = start_server_with("nopty", &line, true);
+    let identity = write_client_key(&dir, &client_kp);
+    let (code, stdout) = run_client(
+        port,
+        &identity,
+        &dir,
+        &["if [ -t 0 ] || [ -t 1 ] || [ -t 2 ]; then echo TTY; fi; \
+           printf 'a\\nb\\000\\r\\003'; printf '%s' \"${TERM-unset}\""],
+    );
+    assert_eq!(code, 0);
+    assert_eq!(stdout, b"a\nb\0\r\x03unset", "got {:?}", String::from_utf8_lossy(&stdout));
+}
+
+#[test]
+fn forced_command_stdin_is_passed_through_unmodified() {
+    // Input bytes that a terminal would interpret (^C = SIGINT, ^D = EOF,
+    // \r -> \n, ^Z, ^\\) must reach a forced command unchanged.
+    let client_kp = sshkeys::generate_keypair();
+    let data: Vec<u8> = (0u8..=255).chain(b"\x03\x04\x1a\x1c\r\n".iter().copied()).collect();
+    let entry = sshkeys::authorized_keys_entry(&client_kp.public, "c");
+    let line = format!("command=\"/usr/bin/head -c {}\" {}", data.len(), entry.trim_end());
+    let (port, dir) = start_server_with("nopty-stdin", &line, true);
+    let identity = write_client_key(&dir, &client_kp);
+    let mut child = client_cmd(port, &identity, &dir, "127.0.0.1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&data).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout, data);
+}
+
+#[test]
+fn forced_command_holds_only_its_own_pipes() {
+    // Descriptor isolation for pipe sessions: 0, 1 and 2 are the session's
+    // pipes (1 and 2 the same one) and nothing else is inherited.
+    let client_kp = sshkeys::generate_keypair();
+    let entry = sshkeys::authorized_keys_entry(&client_kp.public, "c");
+    let line = format!("command=\"/bin/ls -l /proc/self/fd/\" {}", entry.trim_end());
+    let (port, dir) = start_server_with("nopty-fds", &line, true);
+    let identity = write_client_key(&dir, &client_kp);
+    let (code, out) = run_client(port, &identity, &dir, &[]);
+    assert_eq!(code, 0);
+    let targets: Vec<String> = String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|l| l.split_once(" -> ").map(|(_, t)| t.trim().to_string()))
+        .filter(|t| !t.starts_with("/proc/"))
+        .collect();
+    assert_eq!(targets.len(), 3, "{targets:?}");
+    assert!(targets.iter().all(|t| t.starts_with("pipe:")), "{targets:?}");
+    assert_eq!(targets[1], targets[2], "stdout and stderr share one pipe");
+}
+
+/// Run `/bin/sh -c script` with extra client flags; (exit code, stdout,
+/// stderr).
+fn run_flags(port: u16, identity: &Path, dir: &TempDir, flags: &[&str], script: &str) -> (i32, String, String) {
+    let out = client_cmd(port, identity, dir, "127.0.0.1")
+        .args(flags)
+        .args(["--", "/bin/sh", "-c", script])
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+const TTY_PROBE: &str = "if [ -t 0 ] && [ -t 1 ]; then printf 'TTY %s' \"$TERM\"; else printf 'NOTTY %s' \"${TERM-unset}\"; fi";
+
+#[test]
+fn pty_only_when_requested() {
+    // Like ssh: a command runs without a terminal unless -t asks for one.
+    let client_kp = sshkeys::generate_keypair();
+    let (port, dir) = start_server("pty", &client_kp, true);
+    let identity = write_client_key(&dir, &client_kp);
+    let (code, out, _) = run_flags(port, &identity, &dir, &[], TTY_PROBE);
+    assert_eq!((code, out.as_str()), (0, "NOTTY unset"));
+    let (code, out, _) = run_flags(port, &identity, &dir, &["-t"], TTY_PROBE);
+    assert_eq!(code, 0);
+    assert!(out.starts_with("TTY ") && out.len() > 4, "{out:?}");
+    let (_, out, _) = run_flags(port, &identity, &dir, &["-T"], TTY_PROBE);
+    assert_eq!(out, "NOTTY unset");
+}
+
+#[test]
+fn key_options_decide_terminal_permission() {
+    // Forced commands get a terminal only with an explicit `pty` option;
+    // `no-pty` (or `restrict`) denies it for any key. A refused request is
+    // reported on the client's stderr.
+    let client_kp = sshkeys::generate_keypair();
+    let entry = sshkeys::authorized_keys_entry(&client_kp.public, "c");
+    let entry = entry.trim_end();
+    for (opts, want_tty) in [
+        ("command=\"/bin/sh -c\"", false),
+        ("pty,command=\"/bin/sh -c\"", true),
+        ("restrict,pty,command=\"/bin/sh -c\"", true),
+        ("no-pty", false),
+        ("restrict", false),
+    ] {
+        let (port, dir) = start_server_with("ptyopt", &format!("{opts} {entry}"), true);
+        let identity = write_client_key(&dir, &client_kp);
+        // forced: the client argv is the script; otherwise run sh -c
+        let out = if opts.contains("command=") {
+            client_cmd(port, &identity, &dir, "127.0.0.1").args(["-t", "--", TTY_PROBE]).output().unwrap()
+        } else {
+            client_cmd(port, &identity, &dir, "127.0.0.1")
+                .args(["-t", "--", "/bin/sh", "-c", TTY_PROBE])
+                .output()
+                .unwrap()
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{opts}: {stderr}");
+        assert_eq!(stdout.starts_with("TTY "), want_tty, "{opts}: {stdout:?}");
+        assert_eq!(stderr.contains("did not allocate a terminal"), !want_tty, "{opts}: {stderr}");
+    }
+}
+
+#[test]
+fn eof_reaches_commands_without_a_terminal() {
+    // The client's end of input arrives as an (authenticated) EOF message,
+    // so commands that read until EOF finish — also forced commands.
+    let client_kp = sshkeys::generate_keypair();
+    let data: Vec<u8> = (0u8..=255).cycle().take(100_000).collect();
+    let (port, dir) = start_server("eof", &client_kp, true);
+    let identity = write_client_key(&dir, &client_kp);
+    let mut child = client_cmd(port, &identity, &dir, "127.0.0.1")
+        .args(["--", "/bin/cat"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let feed = data.clone();
+    let writer = std::thread::spawn(move || stdin.write_all(&feed)); // then closes
+    let out = child.wait_with_output().unwrap();
+    writer.join().unwrap().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, data, "cat output differs ({} bytes)", out.stdout.len());
+
+    let entry = sshkeys::authorized_keys_entry(&client_kp.public, "c");
+    let line = format!("command=\"/usr/bin/wc -c\" {}", entry.trim_end());
+    let (port, dir) = start_server_with("eof-forced", &line, true);
+    let identity = write_client_key(&dir, &client_kp);
+    let mut child = client_cmd(port, &identity, &dir, "127.0.0.1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&data[..12345]).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "12345");
+}
+
+#[test]
+fn login_without_a_terminal_reads_commands_from_stdin() {
+    // `saltsh host < script`: no command and stdin not a terminal -> the
+    // login shell runs on pipes, reads the script, and ends at EOF.
+    let client_kp = sshkeys::generate_keypair();
+    let (port, dir) = start_server("script", &client_kp, true);
+    let identity = write_client_key(&dir, &client_kp);
+    let mut child = client_cmd(port, &identity, &dir, "127.0.0.1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"echo hi\nexit 3\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n");
+    assert_eq!(out.status.code(), Some(3));
+}
+
+#[test]
+fn command_options_need_no_double_dash() {
+    // ssh-style parsing: the first word after the host starts the command,
+    // so its options — and a literal `--` — reach it untouched.
+    let client_kp = sshkeys::generate_keypair();
+    let (port, dir) = start_server("nodd", &client_kp, true);
+    let identity = write_client_key(&dir, &client_kp);
+    let out = client_cmd(port, &identity, &dir, "127.0.0.1")
+        .args(["/bin/sh", "-c", "printf '%s|' \"$@\"", "x", "-a", "--b", "--", "-p", "1"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "-a|--b|--|-p|1|");
 }

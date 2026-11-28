@@ -7,7 +7,7 @@ Security audit: [`SECURITY.md`](SECURITY.md).
 One binary, two roles:
 
 ```
-saltsh [options] [user@]host [--] [argv...]  # client (ssh role)
+saltsh [options] [user@]host [options] [argv...]  # client (ssh role)
 saltsh serve [options]                   # server (sshd role)
 saltsh keygen [options]                  # generate an Ed25519 keypair
 ```
@@ -21,9 +21,15 @@ A single encrypted PTY connection:
   signatures bound to a BLAKE2b-256 transcript hash, HKDF session keys.
 * **Authentication** — key-only: one Ed25519 challenge/response over the
   encrypted channel, verified against `authorized_keys` (OpenSSH format).
-  Per-entry `from="..."` source-address restrictions and `command="..."`
-  forced commands are honored. No passwords, no keyboard-interactive.
-* **Session** — exactly one PTY per connection. The command argv is
+  Per-entry `from="..."` source-address restrictions, `expiry-time="..."`
+  and `command="..."` forced commands are honored; option parsing is
+  fail-closed (see [authorized_keys options](#authorized_keys-options)).
+  No passwords, no keyboard-interactive.
+* **Session** — exactly one session per connection. Like ssh, an
+  interactive login gets a PTY; commands (`saltsh host cmd args`) and
+  forced commands run on plain pipes — binary-clean, with end of input
+  passed on — unless `-t` asks for a terminal (see
+  [How commands run](#how-commands-run)). The command argv is
   transmitted as a structured array and `execvp`'d verbatim:
   `saltsh host -- echo a "b c" d` passes **3** elements, not 4 (the OpenSSH
   argv bug). Resize (SIGWINCH) and signal forwarding (SIGINT/SIGTSTP) are
@@ -50,8 +56,9 @@ forwarding, agent forwarding, password auth, Windows PTYs.
 ```console
 # per-user mode (default; requires root): the requested user is resolved via
 # /etc/passwd, keys are read from ~<user>/.saltsh/authorized_keys, and the
-# session drops privileges to <user> (setgid + initgroups + setuid + chdir
-# home) before exec
+# session switches to <user> (all of the user's groups via setgroups, then
+# setgid + setuid + chdir home) and runs the command through the user's
+# login shell
 $ sudo saltsh serve --listen 0.0.0.0 --port 23
 
 # shared-file mode: run everything as the server's own user
@@ -73,6 +80,15 @@ use) still print on your terminal with a non-zero exit. Without
 `--pidfile`, the pid is written to `/var/run/saltsh.pid`. All path options
 (`--host-key`, `--authorized-keys`, `--pidfile`, `--log-file`) must be
 absolute paths.
+
+**Connection limits.** The whole login (version exchange, key exchange,
+authentication and the command request) must finish within
+`--login-grace-time` seconds (default 120, like OpenSSH's
+`LoginGraceTime`) — a single deadline, not a per-read timeout. At most
+`--max-startups` (default 64) unauthenticated connections are handled at
+once, and at most `--per-source-max-startups` (default 8) from one client
+address; further connections are closed immediately. Authenticated
+sessions do not count against these limits.
 
 Logging goes to stderr by default; with `--log-file PATH` all server
 logging (host-key generation, startup, connections, auth, errors) is
@@ -124,6 +140,68 @@ reads the local host key file (`--host-key`, or `/etc/saltsh/host_key` as
 root / `~/.saltsh/host_key` otherwise) — no network scan, so there is no
 first-contact MITM ambiguity. A mismatch later still hard-fails, exactly
 like a fresh TOFU pin.
+
+### How commands run
+
+* **Per-user mode**: every command runs through the account's **login
+  shell**, like sshd. An account whose shell is `nologin`, `/bin/false`,
+  `git-shell`, `rbash` or any other restricted shell therefore cannot run
+  arbitrary programs by naming them. For POSIX shells (`sh`, `bash`,
+  `dash`, `ash`, `ksh`, `mksh`, `zsh`, ...) the argv is still passed
+  exactly — as positional parameters to `shell -c 'exec "$0" "$@"'`, never
+  re-split. Any other login shell receives the argv as one OpenSSH-style
+  string (`shell -c "'arg1' 'arg2' ..."`, each element single-quoted) and
+  decides itself what to run.
+* **Shared-file mode** (`--authorized-keys`): the argv is `execvp`'d
+  directly as the server's own user.
+* No command: the login shell starts as an interactive session.
+
+**PTY or pipes.** A session gets a terminal only when the client asks for
+one *and* the key allows it — the same model as ssh:
+
+| client invocation | requests a PTY? |
+|---|---|
+| `saltsh host` (interactive login), stdin is a terminal | yes |
+| `saltsh host < script.sh` (stdin not a terminal) | no — the shell reads the script, ends at EOF |
+| `saltsh host cmd args...` | no |
+| `saltsh -t host cmd args...` (e.g. `top`, `vim`) | yes |
+| `saltsh -T host` | no |
+
+| key (`authorized_keys`) | terminal allowed? |
+|---|---|
+| no options | yes |
+| `command="..."` (forced command) | **no** — unless the line also says `pty` |
+| `no-pty`, or `restrict` | no (`restrict,pty` re-allows it) |
+
+`pty` / `no-pty` / `restrict` are applied in order, last one wins. If a
+requested terminal is refused, the client says so on stderr and the
+session runs on pipes.
+
+Without a terminal:
+
+* The byte streams pass through unmodified in both directions: no
+  `\n` → `\r\n` rewriting, no echo, and input bytes such as `^C`, `^D`,
+  `^Z` or `\r` reach the command as data instead of being interpreted.
+* **End of input is passed on**: when the client's stdin ends (EOF, or
+  `^D` typed at a local terminal) it sends an authenticated `EOF`
+  message and the server closes the command's stdin — so `cat > file`,
+  `wc`, `sort` and scripts piped into a login shell finish normally.
+* stdout and stderr are merged into one stream (the protocol has a
+  single data stream).
+* `TERM` is not set, there is no controlling terminal, and window-size
+  changes are ignored. The local terminal stays in normal (cooked) mode:
+  line editing and echo happen locally, and Ctrl-C / Ctrl-Z are forwarded
+  to the command as SIGINT / SIGTSTP. A disconnect closes the command's
+  pipes and sends SIGHUP to its process group.
+
+With a terminal the local terminal is switched to raw mode and every key
+goes to the remote side; end of input is typed there (`^D`), and the
+client's EOF is ignored.
+
+Each session holds no other descriptor from the server (no other
+session's terminal or pipes, no sockets, no log file), has default signal
+dispositions, and — in per-user mode — exactly the user's supplementary
+groups.
 
 ### Session environment
 
@@ -184,47 +262,127 @@ $ ssh-keygen -lf /etc/saltsh/host_key
 
 ### authorized_keys options
 
-Two OpenSSH options are honored per entry:
-
 ```
 # only allow this key from specific addresses (wildcards, CIDR, !negation)
 from="10.0.0.0/8,192.168.1.7,!10.0.0.66" ssh-ed25519 AAAA... alice@work
 
-# forced command: overrides whatever the client asks for
-command="/opt/backup/run" ssh-ed25519 AAAA... backup-bot
+# key stops working after this date (local time; append Z for UTC)
+expiry-time="20271231" ssh-ed25519 AAAA... contractor
+
+# forced command — READ THE WARNING BELOW before using one
+command="/usr/local/bin/backup-only" ssh-ed25519 AAAA... backup-bot
 ```
 
 * `from="..."` — comma-separated pattern list matched against the peer's
   IPv4 address (OpenSSH `match_pattern_list` semantics: a matching
   `!`-negated pattern rejects; otherwise any positive match allows). IPv4
-  CIDR blocks match numerically; `*`/`?` wildcards are supported. Multiple
-  `from=` options are concatenated. saltsh is **IPv4-only**: both the
-  client and server resolve and bind IPv4 addresses, and IPv6 patterns
-  never match (fail-closed).
-* `command="..."` — forced command. The command string is split on
-  whitespace and the client's requested argv is appended **as-is**, each
-  element preserved as a single argument (no shell joining or
-  re-splitting):
-  `command="/bin/echo forced"` + client `-- a "b c"` executes
-  `["echo", "forced", "a", "b c"]`. The original request is available to
-  the forced command via `SSH_ORIGINAL_COMMAND`. Note this differs from
-  OpenSSH, which runs the forced command through the user's shell; saltsh
-  passes arguments directly to `execvp`.
+  CIDR blocks match numerically; `*`/`?` wildcards are supported. saltsh
+  is **IPv4-only**: both the client and server resolve and bind IPv4
+  addresses, and IPv6 patterns never match.
+* `expiry-time="YYYYMMDD[HHMM[SS]][Z]"` — the key is refused after this
+  time.
+* `command="..."` — forced command, split on whitespace; the client's argv
+  is **appended** (see below). The original request is also available as
+  `SSH_ORIGINAL_COMMAND`.
+
+> **⚠ Forced commands receive the client's arguments.**
+>
+> In OpenSSH, `command="..."` *replaces* whatever the client asked for;
+> the forced command can only look at the request via
+> `$SSH_ORIGINAL_COMMAND`. **saltsh is different by design: it appends
+> the client's argv to the forced command as extra arguments**, each
+> element kept intact. `command="/bin/echo forced"` plus a client running
+> `saltsh host -- a "b c"` executes `echo forced a "b c"`.
+>
+> A forced command is therefore only a restriction if the program you
+> name is safe to run with **arbitrary extra arguments chosen by the
+> client**. Many common programs are not:
+>
+> | forced command | the client sends | effect |
+> |---|---|---|
+> | `command="/bin/sh -c"` | `-- 'any shell code'` | runs anything |
+> | `command="/usr/bin/env"` | `-- /bin/sh` | runs anything |
+> | `command="/usr/bin/find /backups"` | `-- -exec /bin/sh -c '...' ;` | runs anything |
+> | `command="/usr/bin/tar -czf - /data"` | `-- --checkpoint=1 --checkpoint-action=exec=...` | runs anything |
+> | `command="/bin/cat /var/log/app.log"` | `-- /home/backup/.saltsh/id_ed25519` | reads any file the account can |
+>
+> Safe patterns:
+>
+> * Point `command=` at a small wrapper that **rejects arguments it does
+>   not expect**:
+>
+>   ```sh
+>   #!/bin/sh
+>   # /usr/local/bin/backup-only: takes no client arguments at all
+>   [ "$#" -eq 0 ] || { echo "backup-only: no arguments allowed" >&2; exit 1; }
+>   exec /opt/backup/run
+>   ```
+>
+>   or that checks each argument against an allowlist
+>   (`case "$1" in status|start) ;; *) exit 1 ;; esac`).
+> * Never name a shell, `env`, `find`, `xargs`, `tar`, `awk`, `git`, an
+>   interpreter (`python3`, `perl`, ...) or any other program with
+>   "run this"/"read that" options directly as a forced command.
+> * Use `"$@"` in the wrapper, not `$SSH_ORIGINAL_COMMAND`: the latter is
+>   the argv joined with single spaces, so argument boundaries are lost —
+>   and never `eval` it.
+> * In per-user mode the forced command (with its appended arguments)
+>   still runs through the account's login shell, so a `nologin` account
+>   stays locked even with a forced-command key.
+
+**Parsing is fail-closed** — a restriction is never dropped silently:
+
+* Option names are case-insensitive (`COMMAND=` = `command=`), as in
+  OpenSSH. Values must be double-quoted; `\"` is the only escape.
+* A line with an **unknown or misspelled option**, a duplicate
+  `command=`/`from=`, a malformed `from=` CIDR block, an unparsable
+  `expiry-time`, or an option saltsh cannot honor (`cert-authority`,
+  `principals=`, `verify-required`) is **refused as a whole**, and the
+  server logs a warning naming the file and line.
+* Accepted without effect (saltsh has no forwarding, agent, X11 or rc
+  features): `restrict`, `[no-]port-forwarding`, `[no-]agent-forwarding`,
+  `[no-]x11-forwarding`, `[no-]user-rc`, `no-touch-required`,
+  `permitopen=`, `permitlisten=`, `tunnel=`, `environment=` (saltsh never
+  sets per-key variables). `pty`, `no-pty` and `restrict` control the
+  terminal (see [How commands run](#how-commands-run)).
+* Lines for other key types (`ssh-rsa`, ...) and comments are skipped.
+
+**File checks** (like OpenSSH's `StrictModes`): an `authorized_keys` file
+must be a regular file of at most 1 MiB, owned by root or its user and not
+group/world-writable. In per-user mode every directory from the file up
+to the user's home directory must pass the same ownership/mode check —
+so a group-writable home (or `~/.saltsh`) disables key login for that
+account until fixed. Symlinks to devices or FIFOs are refused. A refused
+file is logged.
 
 ### Client
 
 ```console
 $ saltsh example.com                    # default: $SHELL login shell
 $ saltsh alice@example.com              # log in as a specific user
-$ saltsh example.com -- echo a "b c" d  # exact argv, no shell re-splitting
-$ saltsh -p 2323 -l alice -i ~/.saltsh/id_ed25519 example.com -- uname -a
+$ saltsh example.com echo a "b c" d     # exact argv, no shell re-splitting
+$ saltsh example.com ls -la /tmp        # the command's options need no --
+$ saltsh example.com sort < in > out    # no terminal: binary-clean, EOF passed on
+$ saltsh example.com -t top             # a command that needs a terminal
+$ saltsh -p 2323 -l alice -i ~/.saltsh/id_ed25519 example.com uname -a
 ```
 
+Option parsing works like ssh's: options may come before the host and
+directly after it, and the first word after the host that is not an
+option starts the command — everything from there on (including words
+like `-p` or `--`) is passed to the command unchanged. A `--` before the
+command ends option parsing explicitly (`saltsh host -- -weird-cmd`).
+
 The login name comes from `user@host`, then `-l/--user`, then `$USER`.
-Options: `-p/--port` (23 — the abandoned telnet port), `-i/--identity`
+Options: `-t` (request a terminal for a command), `-T` (never request
+one), `-p/--port` (23 — the abandoned telnet port), `-i/--identity`
 (`~/.saltsh/id_ed25519`), `-P/--passphrase` (prompts if omitted),
 `--accept-new`, `--protocol IDENT` (default `SALTSH/1`; must match the
-server's). All path options must be **absolute**, with one exception:
+server's). The first-contact host-key question is asked on the terminal
+(`/dev/tty`), never read from stdin; without a terminal the connection is
+refused — non-interactive use needs `--accept-new` or a pre-seeded
+`known_hosts`. A host key is only pinned after the server has proven it
+holds the private key. All path options must be **absolute**, with one exception:
 `keygen -f` may be relative to the current directory. `~` is never
 expanded — use `$HOME/...`.
 
@@ -258,8 +416,10 @@ scanners get no banner. A custom identifier only reduces scan noise — it
 is obscurity, not security (anyone can capture it). Packet framing after
 KEX: `secretbox(nonce, u32_be(len) || plaintext)` with
 `nonce = u64_be(seq) || 0^16`, one counter per direction. Message tags:
-`0x01..0x05` auth, `0x10` exec, `0x20` pty data, `0x21` resize,
-`0x22` exit status, `0x30` signal. All integers big-endian.
+`0x01..0x05` auth, `0x10` exec (with a PTY-request flag), `0x11` exec ok
+(says whether a PTY was allocated), `0x20` session data, `0x21` resize,
+`0x22` exit status, `0x23` end of input, `0x30` signal. All integers
+big-endian.
 
 ## Build
 
@@ -277,7 +437,7 @@ packaging. Equivalent cargo invocations:
 
 ```console
 $ cargo build --release            # statically linked musl binary (see below)
-$ cargo test                       # 44 unit + 31 end-to-end tests
+$ cargo test                       # 57 unit + 52 end-to-end tests
 ```
 
 `.cargo/config.toml` sets `x86_64-unknown-linux-musl` as the default target
@@ -328,14 +488,30 @@ deliberate adjustments, all documented in the code:
 4. **Rekey = disconnect.** Exceeding 2^32 packets or 2^40 bytes closes the
    connection rather than rekeying; v1 sessions cannot realistically reach
    either bound. A full rekey exchange is future work.
+5. **PTY on request.** The spec's "interactive PTY only" became ssh's
+   model: the client requests a PTY (EXEC carries a flag; by default only
+   for interactive logins on a terminal, `-t`/`-T` override), the key may
+   refuse it (`no-pty`, `restrict`, forced commands without `pty`), and
+   the server answers with `EXEC_OK {pty}` (tag `0x11`). Sessions without
+   a PTY run on pipes; the client signals end of input with `EOF` (tag
+   `0x23`), an authenticated message rather than a TCP half-close (which
+   an on-path attacker could forge to truncate a command's input).
+   `PTY_DATA` (`0x20`) carries the session bytes either way. This changed
+   the wire format: client and server must be the same version.
 
 ## Known limitations (v1)
 
 * No algorithm negotiation by design — a primitive break means a protocol
   version bump.
-* No EOF message in the session layer (like SSH): closing local stdin does
-  not terminate the remote program; sessions end when the remote process
-  exits.
-* Per-user `authorized_keys` files are not ownership-checked (`StrictModes`
-  equivalent is future hardening).
+* On a PTY the client's end of input is ignored (type `^D` in the remote
+  terminal instead); sessions end when the remote process exits.
+* A remote command that never reads its input eventually stalls the
+  input direction (there is no flow-control window); signals sent from
+  the client queue behind that input.
+* Accounts that are locked or expired in `/etc/shadow` are not detected
+  (no PAM); remove the account's `authorized_keys` or give it a `nologin`
+  shell to lock it out of saltsh.
+* For login shells that are not POSIX-compatible (fish, tcsh, ...) the
+  per-user argv is passed as one quoted string, so exact-argv semantics
+  are up to that shell.
 * The client and server are Linux/Unix-only (PTY, termios) and IPv4-only.

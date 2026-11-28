@@ -13,9 +13,11 @@ pub const AUTH_SIG: u8 = 0x03;
 pub const AUTH_OK: u8 = 0x04;
 pub const AUTH_FAIL: u8 = 0x05;
 pub const EXEC: u8 = 0x10;
+pub const EXEC_OK: u8 = 0x11;
 pub const PTY_DATA: u8 = 0x20;
 pub const RESIZE: u8 = 0x21;
 pub const EXIT_STATUS: u8 = 0x22;
+pub const EOF: u8 = 0x23;
 pub const SIGNAL: u8 = 0x30;
 
 /// Maximum username length (protects getpwnam lookups).
@@ -37,21 +39,31 @@ pub enum Msg {
     AuthSig { signature: Vec<u8> },
     AuthOk,
     AuthFail,
-    /// c->s: argv[], TERM, rows, cols, env[] (KEY=VALUE strings). An empty
-    /// argv means "no command" — the server picks the login shell, or runs
-    /// a forced command from authorized_keys. The env list is always empty
-    /// from the saltsh client and is ignored by the server (clients cannot
-    /// set environment variables in the remote session); it exists for wire
-    /// compatibility only.
+    /// c->s: argv[], TERM, rows, cols, pty, env[] (KEY=VALUE strings). An
+    /// empty argv means "no command" — the server picks the login shell, or
+    /// runs a forced command from authorized_keys. `pty` requests a
+    /// terminal (TERM/rows/cols only matter then); the server may refuse.
+    /// The env list is always empty from the saltsh client and is ignored
+    /// by the server (clients cannot set environment variables in the
+    /// remote session).
     Exec {
         argv: Vec<String>,
         term: String,
         rows: u32,
         cols: u32,
+        pty: bool,
         env: Vec<String>,
     },
-    /// both: raw PTY bytes.
+    /// s->c: the session has started; `pty` says whether it runs on a
+    /// terminal (the client uses raw mode only then).
+    ExecOk { pty: bool },
+    /// both: raw session bytes (terminal or pipe data).
     PtyData(Vec<u8>),
+    /// c->s: end of the client's input. Without a terminal the server closes
+    /// the session's stdin; on a terminal it is ignored (type ^D there).
+    /// Authenticated like every packet, so — unlike a TCP half-close — an
+    /// on-path attacker cannot forge it to truncate a command's input.
+    Eof,
     /// c->s: new window size.
     Resize { rows: u32, cols: u32 },
     /// s->c: u32 exit code (128+signal if killed by a signal).
@@ -79,7 +91,7 @@ impl Msg {
             }
             Msg::AuthOk => w.u8(AUTH_OK),
             Msg::AuthFail => w.u8(AUTH_FAIL),
-            Msg::Exec { argv, term, rows, cols, env } => {
+            Msg::Exec { argv, term, rows, cols, pty, env } => {
                 w.u8(EXEC);
                 w.u32(argv.len() as u32);
                 for a in argv {
@@ -88,15 +100,21 @@ impl Msg {
                 w.str(term);
                 w.u32(*rows);
                 w.u32(*cols);
+                w.u8(u8::from(*pty));
                 w.u32(env.len() as u32);
                 for e in env {
                     w.str(e);
                 }
             }
+            Msg::ExecOk { pty } => {
+                w.u8(EXEC_OK);
+                w.u8(u8::from(*pty));
+            }
             Msg::PtyData(d) => {
                 w.u8(PTY_DATA);
                 w.raw(d);
             }
+            Msg::Eof => w.u8(EOF),
             Msg::Resize { rows, cols } => {
                 w.u8(RESIZE);
                 w.u32(*rows);
@@ -124,6 +142,7 @@ impl Msg {
                     return Err(Error::proto("username too long"));
                 }
                 let pubkey_blob = r.bytes("pubkey_blob")?;
+                r.expect_done("AUTH_REQ")?;
                 Msg::AuthReq { username, pubkey_blob }
             }
             AUTH_CHALLENGE => {
@@ -156,6 +175,7 @@ impl Msg {
                 let term = r.str_utf8("term")?;
                 let rows = r.u32()?;
                 let cols = r.u32()?;
+                let pty = r.flag("pty")?;
                 let envc = r.u32()? as usize;
                 if envc > MAX_ENV {
                     return Err(Error::proto("too many env entries"));
@@ -165,7 +185,16 @@ impl Msg {
                     env.push(r.str_utf8("env")?);
                 }
                 r.expect_done("EXEC")?;
-                Msg::Exec { argv, term, rows, cols, env }
+                Msg::Exec { argv, term, rows, cols, pty, env }
+            }
+            EXEC_OK => {
+                let pty = r.flag("pty")?;
+                r.expect_done("EXEC_OK")?;
+                Msg::ExecOk { pty }
+            }
+            EOF => {
+                r.expect_done("EOF")?;
+                Msg::Eof
             }
             PTY_DATA => {
                 let d = r.rest();
@@ -271,6 +300,15 @@ impl<'a> Rd<'a> {
         String::from_utf8(b).map_err(|_| Error::proto(format!("{what} is not valid UTF-8")))
     }
 
+    /// A boolean byte: exactly 0 or 1.
+    fn flag(&mut self, what: &str) -> Result<bool> {
+        match self.take(1, what)?[0] {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(Error::proto(format!("{what} flag must be 0 or 1"))),
+        }
+    }
+
     fn array32(&mut self, what: &str) -> Result<[u8; 32]> {
         let b = self.take(32, what)?;
         Ok(b.try_into().expect("32 bytes"))
@@ -336,14 +374,19 @@ mod tests {
         roundtrip(&Msg::AuthSig { signature: vec![9u8; 64] });
         roundtrip(&Msg::AuthOk);
         roundtrip(&Msg::AuthFail);
-        roundtrip(&Msg::Exec {
-            argv: vec!["a".into(), "b c".into(), "d".into()],
-            term: "xterm-256color".into(),
-            rows: 24,
-            cols: 80,
-            env: vec!["LANG=C.UTF-8".into()],
-        });
+        for pty in [false, true] {
+            roundtrip(&Msg::Exec {
+                argv: vec!["a".into(), "b c".into(), "d".into()],
+                term: "xterm-256color".into(),
+                rows: 24,
+                cols: 80,
+                pty,
+                env: vec!["LANG=C.UTF-8".into()],
+            });
+            roundtrip(&Msg::ExecOk { pty });
+        }
         roundtrip(&Msg::PtyData(b"hello world".to_vec()));
+        roundtrip(&Msg::Eof);
         roundtrip(&Msg::Resize { rows: 40, cols: 132 });
         roundtrip(&Msg::ExitStatus(0));
         roundtrip(&Msg::Signal(2));
@@ -356,6 +399,7 @@ mod tests {
             term: "xterm".into(),
             rows: 24,
             cols: 80,
+            pty: false,
             env: vec![],
         };
         let dec = Msg::decode(&m.encode()).unwrap();
@@ -371,6 +415,13 @@ mod tests {
         assert!(Msg::decode(&[0x99]).is_err());
         assert!(Msg::decode(&[AUTH_OK, 0x00]).is_err()); // trailing byte
         assert!(Msg::decode(&[AUTH_CHALLENGE]).is_err()); // truncated
+        // flags must be exactly 0 or 1; EOF carries nothing
+        assert!(Msg::decode(&[EXEC_OK, 2]).is_err());
+        assert!(Msg::decode(&[EOF, 0]).is_err());
+        // AUTH_REQ with trailing bytes
+        let mut req = Msg::AuthReq { username: "a".into(), pubkey_blob: vec![1] }.encode();
+        req.push(0);
+        assert!(Msg::decode(&req).is_err());
         // username with NUL
         let mut w = Wr::new();
         w.u8(AUTH_REQ);

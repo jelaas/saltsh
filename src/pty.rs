@@ -3,6 +3,7 @@
 
 use std::ffi::c_int;
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use zeroize::Zeroize;
 
 use crate::error::{Error, Result};
@@ -84,6 +85,53 @@ pub fn set_winsize_fd(fd: c_int, rows: u16, cols: u16) -> Result<()> {
         return Err(Error::Pty(format!("TIOCSWINSZ failed: {}", io::Error::last_os_error())));
     }
     Ok(())
+}
+
+/// A pseudo-terminal pair. Both ends are opened `O_CLOEXEC` atomically, so
+/// no other session's child can ever inherit them across `exec` — even a
+/// child forked concurrently by another connection thread. (`openpty` /
+/// `forkpty` in both musl and glibc open the master *without*
+/// close-on-exec, which leaked every live session's master into every
+/// other session.)
+pub struct Pty {
+    pub master: OwnedFd,
+    pub slave: OwnedFd,
+}
+
+/// Open a new PTY pair with the given window size.
+pub fn open_pty(rows: u16, cols: u16) -> Result<Pty> {
+    let err = |what: &str| Error::Pty(format!("{what}: {}", io::Error::last_os_error()));
+    unsafe {
+        let m = libc::open(
+            c"/dev/ptmx".as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        );
+        if m < 0 {
+            return Err(err("cannot open /dev/ptmx"));
+        }
+        let master = OwnedFd::from_raw_fd(m);
+        if libc::grantpt(m) != 0 {
+            return Err(err("grantpt failed"));
+        }
+        if libc::unlockpt(m) != 0 {
+            return Err(err("unlockpt failed"));
+        }
+        let mut name = [0 as libc::c_char; 128];
+        let r = libc::ptsname_r(m, name.as_mut_ptr(), name.len());
+        if r != 0 {
+            return Err(Error::Pty(format!(
+                "ptsname_r failed: {}",
+                io::Error::from_raw_os_error(r)
+            )));
+        }
+        let s = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
+        if s < 0 {
+            return Err(err("cannot open pty slave"));
+        }
+        let slave = OwnedFd::from_raw_fd(s);
+        set_winsize_fd(master.as_raw_fd(), rows, cols)?;
+        Ok(Pty { master, slave })
+    }
 }
 
 /// Write all bytes to an fd, retrying EINTR.
@@ -178,6 +226,16 @@ pub fn read_passphrase(prompt: &str) -> Result<zeroize::Zeroizing<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_pty_is_close_on_exec() {
+        let p = open_pty(24, 80).unwrap();
+        for fd in [p.master.as_raw_fd(), p.slave.as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(flags & libc::FD_CLOEXEC != 0, "fd {fd} lacks FD_CLOEXEC");
+        }
+        assert_eq!(get_winsize(p.slave.as_raw_fd()), (24, 80));
+    }
 
     #[test]
     fn clamp_size_is_sane() {

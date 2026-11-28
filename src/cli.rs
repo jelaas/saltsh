@@ -19,6 +19,9 @@ pub struct ClientOpts {
     pub protocol: Option<String>,
     /// Command argv (after `--` or any extra positionals).
     pub argv: Vec<String>,
+    /// Terminal request: `Some(true)` with `-t`, `Some(false)` with `-T`,
+    /// `None` = default (a PTY only for an interactive login on a terminal).
+    pub pty: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +41,41 @@ pub struct ServerOpts {
     pub log_file: Option<PathBuf>,
     /// Prefix every log line with a local timestamp.
     pub log_timestamps: bool,
+    /// Total time an unauthenticated connection may take from accept to a
+    /// complete EXEC request (OpenSSH `LoginGraceTime`).
+    pub login_grace_time: std::time::Duration,
+    /// Maximum concurrent unauthenticated connections (OpenSSH
+    /// `MaxStartups`); further connections are closed immediately.
+    pub max_startups: usize,
+    /// Maximum concurrent unauthenticated connections from one source
+    /// address (OpenSSH `PerSourceMaxStartups`).
+    pub per_source_max_startups: usize,
+}
+
+/// Default `--login-grace-time` (OpenSSH's LoginGraceTime default).
+pub const DEFAULT_LOGIN_GRACE_SECS: u64 = 120;
+/// Default `--max-startups`.
+pub const DEFAULT_MAX_STARTUPS: usize = 64;
+/// Default `--per-source-max-startups`.
+pub const DEFAULT_PER_SOURCE_MAX_STARTUPS: usize = 8;
+
+impl Default for ServerOpts {
+    fn default() -> Self {
+        ServerOpts {
+            listen: "0.0.0.0".to_string(),
+            port: 23,
+            host_key_path: None,
+            authorized_keys_path: None,
+            daemonize: false,
+            pidfile: None,
+            protocol: crate::crypto::DEFAULT_VERSION.to_string(),
+            log_file: None,
+            log_timestamps: false,
+            login_grace_time: std::time::Duration::from_secs(DEFAULT_LOGIN_GRACE_SECS),
+            max_startups: DEFAULT_MAX_STARTUPS,
+            per_source_max_startups: DEFAULT_PER_SOURCE_MAX_STARTUPS,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -187,23 +225,36 @@ fn parse_client(args: &[String]) -> Result<Command> {
         accept_new: false,
         protocol: None,
         argv: Vec::new(),
+        pty: None,
     };
+    // ssh-style: options may come before the host and directly after it,
+    // but the first non-option word after the host starts the command, and
+    // everything from there on is argv — `saltsh host ls -la` runs
+    // `ls -la`, `saltsh host git log -- f` passes the `--` on to git. A
+    // `--` before the command ends option parsing explicitly.
     let mut host: Option<String> = None;
     let mut argv: Vec<String> = Vec::new();
-    let mut after_ddash = false;
     let mut i = 0;
     while i < args.len() {
-        let a = args[i].clone();
-        if after_ddash {
-            argv.push(a);
-            i += 1;
-            continue;
-        }
-        match a.as_str() {
-            "--" => after_ddash = true,
+        let a = args[i].as_str();
+        match a {
+            "--" => {
+                let mut rest = args[i + 1..].iter();
+                if host.is_none() {
+                    // `saltsh -- host cmd...`: the host may follow `--`
+                    if let Some(h) = rest.next() {
+                        host = Some(set_host(&mut opts, h)?);
+                    }
+                }
+                argv.extend(rest.cloned());
+                break;
+            }
             "-h" | "--help" => return Ok(Command::Help),
             "-V" | "--version" => return Ok(Command::Version),
             "--accept-new" => opts.accept_new = true,
+            // -tt is accepted for ssh muscle memory; -t already forces
+            "-t" | "-tt" => opts.pty = Some(true),
+            "-T" => opts.pty = Some(false),
             "--protocol" => {
                 i += 1;
                 let v = args
@@ -241,29 +292,12 @@ fn parse_client(args: &[String]) -> Result<Command> {
             s if s.starts_with('-') && s.len() > 1 => {
                 return Err(Error::usage(format!("unknown option '{s}' (see --help)")));
             }
-            s => {
-                if host.is_none() {
-                    // `[user@]host` form: split on the LAST '@' (OpenSSH
-                    // convention), but only when -l/--user wasn't given —
-                    // an explicit -l takes precedence.
-                    if opts.username.is_empty() {
-                        if let Some(idx) = s.rfind('@') {
-                            let (user, h) = (&s[..idx], &s[idx + 1..]);
-                            if user.is_empty() || h.is_empty() {
-                                return Err(Error::usage(format!("invalid host '{s}'")));
-                            }
-                            opts.username = user.to_string();
-                            host = Some(h.to_string());
-                            i += 1;
-                            continue;
-                        }
-                    }
-                    host = Some(s.to_string());
-                } else {
-                    // extra positionals are argv, split by the invoking
-                    // shell — the exact elements are preserved (spec §2.6)
-                    argv.push(s.to_string());
-                }
+            s if host.is_none() => host = Some(set_host(&mut opts, s)?),
+            _ => {
+                // The command starts here: the exact elements, as split by
+                // the invoking shell, are preserved (spec §2.6).
+                argv.extend(args[i..].iter().cloned());
+                break;
             }
         }
         i += 1;
@@ -277,18 +311,25 @@ fn parse_client(args: &[String]) -> Result<Command> {
     Ok(Command::Client(opts))
 }
 
+/// Take the `[user@]host` positional: split on the LAST '@' (OpenSSH
+/// convention), but only when -l/--user wasn't given before it — an
+/// explicit -l takes precedence. Returns the host.
+fn set_host(opts: &mut ClientOpts, s: &str) -> Result<String> {
+    if opts.username.is_empty() {
+        if let Some(idx) = s.rfind('@') {
+            let (user, h) = (&s[..idx], &s[idx + 1..]);
+            if user.is_empty() || h.is_empty() {
+                return Err(Error::usage(format!("invalid host '{s}'")));
+            }
+            opts.username = user.to_string();
+            return Ok(h.to_string());
+        }
+    }
+    Ok(s.to_string())
+}
+
 fn parse_serve(args: &[String]) -> Result<Command> {
-    let mut opts = ServerOpts {
-        listen: "0.0.0.0".to_string(),
-        port: 23,
-        host_key_path: None,
-        authorized_keys_path: None,
-        daemonize: false,
-        pidfile: None,
-        protocol: crate::crypto::DEFAULT_VERSION.to_string(),
-        log_file: None,
-        log_timestamps: false,
-    };
+    let mut opts = ServerOpts::default();
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -344,6 +385,26 @@ fn parse_serve(args: &[String]) -> Result<Command> {
                 opts.log_file = Some(require_abs(v, "--log-file")?);
             }
             "--log-timestamps" => opts.log_timestamps = true,
+            "--login-grace-time" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| Error::usage("--login-grace-time requires seconds"))?;
+                let secs = parse_count(v, "--login-grace-time", 1, 3600)?;
+                opts.login_grace_time = std::time::Duration::from_secs(secs as u64);
+            }
+            "--max-startups" => {
+                i += 1;
+                let v = args.get(i).ok_or_else(|| Error::usage("--max-startups requires a number"))?;
+                opts.max_startups = parse_count(v, "--max-startups", 1, 100_000)?;
+            }
+            "--per-source-max-startups" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| Error::usage("--per-source-max-startups requires a number"))?;
+                opts.per_source_max_startups = parse_count(v, "--per-source-max-startups", 1, 100_000)?;
+            }
             s if s.starts_with('-') => {
                 return Err(Error::usage(format!("unknown option '{s}' (see --help)")));
             }
@@ -352,6 +413,14 @@ fn parse_serve(args: &[String]) -> Result<Command> {
         i += 1;
     }
     Ok(Command::Serve(opts))
+}
+
+/// A bounded positive integer option value.
+fn parse_count(v: &str, flag: &str, min: usize, max: usize) -> Result<usize> {
+    match v.parse::<usize>() {
+        Ok(n) if (min..=max).contains(&n) => Ok(n),
+        _ => Err(Error::usage(format!("{flag} must be a number in {min}..={max}, got '{v}'"))),
+    }
 }
 
 fn parse_port(v: &str) -> Result<u16> {
@@ -403,6 +472,9 @@ Client options:
   -i, --identity PATH      private key, absolute path (default:
                            ~/.saltsh/id_ed25519)
   -P, --passphrase PASS    private key passphrase (prompts if omitted)
+  -t                       request a terminal (PTY) even when running a
+                           command (e.g. for top, vim)
+  -T                       never request a terminal
       --accept-new         automatically accept a new host key (TOFU)
       --protocol IDENT     protocol identifier sent in the version exchange
                            (default: SALTSH/1; both ends must match).
@@ -412,8 +484,14 @@ Client options:
   -h, --help               show this help
   -V, --version            show version
 
+  Like ssh, options may also follow the host; the first word after the
+  host that is not an option starts the command, so no `--` is needed:
+    saltsh alice@example.com ls -la /tmp
   The command argv is passed exactly as given — no shell re-splitting:
-    saltsh alice@example.com -- echo a \"b c\" d   # 3 argv elements
+    saltsh alice@example.com echo a \"b c\" d      # 3 argv elements
+  Like ssh, a terminal is requested only for an interactive login (no
+  command) on a terminal; commands run on plain pipes (binary-clean, end
+  of input is passed on) unless -t is given.
 
 Server options:
   -p, --port PORT          listen port (default: 23; binding it requires root)
@@ -441,8 +519,21 @@ Server options:
                            down on scanner noise, it is not real security.
       --log-file PATH      append all server logging to this file instead
                            of stderr (absolute path)
-      --log-timestamps    prefix every log line with a local timestamp
+      --log-timestamps     prefix every log line with a local timestamp
                            ([YYYY-MM-DD HH:MM:SS])
+      --login-grace-time SECS
+                           total time a connection may take to authenticate
+                           and send its command (default: 120)
+      --max-startups N     max concurrent unauthenticated connections;
+                           more are closed immediately (default: 64)
+      --per-source-max-startups N
+                           the same limit per client address (default: 8)
+
+  Per-user mode runs every command through the account's login shell, so
+  nologin / restricted shells are enforced (argv stays exact for POSIX
+  shells). A command=\"...\" forced command gets the client's argv APPENDED
+  as extra arguments - see README \"authorized_keys options\" before
+  using one - and runs without a PTY (unless the key line says pty).
 
 Keygen options:
   -f PATH                  output private key; may be relative to the
@@ -513,6 +604,40 @@ mod tests {
         assert_eq!(o.identity, Some(PathBuf::from("/tmp/k")));
         assert!(o.accept_new);
         assert_eq!(o.argv, vec!["ls"]);
+        assert_eq!(o.pty, None);
+        for (flag, want) in [("-t", Some(true)), ("-tt", Some(true)), ("-T", Some(false))] {
+            let Command::Client(o) = parse(&s(&[flag, "host", "--", "top"])).unwrap() else {
+                panic!("not client")
+            };
+            assert_eq!(o.pty, want, "{flag}");
+        }
+    }
+
+    #[test]
+    fn options_stop_at_the_command_like_ssh() {
+        let client = |a: &[&str]| match parse(&s(a)).unwrap() {
+            Command::Client(o) => o,
+            _ => panic!("not client"),
+        };
+        // the command's own options need no `--`
+        let o = client(&["host", "ls", "-la", "/tmp"]);
+        assert_eq!(o.argv, vec!["ls", "-la", "/tmp"]);
+        // options right after the host are still saltsh's
+        let o = client(&["host", "-t", "-p", "2222", "top", "-d", "1"]);
+        assert_eq!((o.pty, o.port), (Some(true), 2222));
+        assert_eq!(o.argv, vec!["top", "-d", "1"]);
+        // once the command started, saltsh options and `--` belong to it
+        let o = client(&["host", "git", "log", "-p", "5", "--", "f"]);
+        assert_eq!(o.port, 23);
+        assert_eq!(o.argv, vec!["git", "log", "-p", "5", "--", "f"]);
+        // `--` before the command ends option parsing; it may precede the host
+        let o = client(&["host", "--", "-weird", "x"]);
+        assert_eq!(o.argv, vec!["-weird", "x"]);
+        let o = client(&["-l", "bob", "--", "-host", "cmd"]);
+        assert_eq!((o.host.as_str(), o.username.as_str()), ("-host", "bob"));
+        assert_eq!(o.argv, vec!["cmd"]);
+        // unknown options before the command are still errors
+        assert!(parse(&s(&["host", "-z", "ls"])).is_err());
     }
 
     #[test]
@@ -618,6 +743,18 @@ mod tests {
             panic!()
         };
         assert!(o.log_timestamps);
+        assert_eq!(o.login_grace_time, std::time::Duration::from_secs(120));
+        assert_eq!((o.max_startups, o.per_source_max_startups), (64, 8));
+        let Command::Serve(o) = parse(&s(&[
+            "serve", "--login-grace-time", "5", "--max-startups", "3", "--per-source-max-startups", "1",
+        ]))
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!(o.login_grace_time, std::time::Duration::from_secs(5));
+        assert_eq!((o.max_startups, o.per_source_max_startups), (3, 1));
+        assert!(parse(&s(&["serve", "--login-grace-time", "0"])).is_err());
+        assert!(parse(&s(&["serve", "--max-startups", "x"])).is_err());
         // invalid identifiers are rejected
         assert!(parse(&s(&["--protocol", "", "host"])).is_err());
         assert!(parse(&s(&["--protocol", "has space", "host"])).is_err());

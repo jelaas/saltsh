@@ -7,15 +7,13 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread;
 
-use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, VerifyingKey};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 use zeroize::Zeroize;
 
 use crate::cli::ClientOpts;
 use crate::crypto;
-use crate::crypto::{
-    derive_keys, session_id, OpenBox, SealBox, HOST_SIG_CONTEXT,
-};
+use crate::crypto::{derive_keys, session_id, OpenBox, SealBox};
 use crate::error::{Error, Result};
 use crate::msg::{self, Msg};
 use crate::pty::{self, RawMode};
@@ -85,7 +83,7 @@ pub fn run(opts: ClientOpts) -> Result<u32> {
     if !shared.was_contributory() {
         return Err(Error::proto("low-order public key in key exchange"));
     }
-    let shared_bytes = shared.to_bytes();
+    let mut shared_bytes = shared.to_bytes();
     let sid = session_id(
         &vline,
         &vline,
@@ -105,6 +103,7 @@ pub fn run(opts: ClientOpts) -> Result<u32> {
     // by the xsalsa20poly1305 crate on drop).
     c2s.zeroize();
     s2c.zeroize();
+    shared_bytes.zeroize();
 
     // 6. Authenticate (single challenge/response).
     let pubkey_blob = sshkeys::ssh_ed25519_pubkey_blob(&key.public);
@@ -124,29 +123,43 @@ pub fn run(opts: ClientOpts) -> Result<u32> {
         _ => return Err(Error::proto("expected AUTH_OK/AUTH_FAIL")),
     }
 
-    // 7. Exec request: exact argv, TERM, window size (spec §5.5).
-    // An empty argv means "no command" — the server then picks the login
-    // shell, or runs a forced command from authorized_keys.
+    // 7. Exec request: exact argv, terminal request, TERM, window size
+    // (spec §5.5). An empty argv means "no command" — the server then picks
+    // the login shell, or runs a forced command from authorized_keys.
+    // Like ssh, a terminal is requested only for an interactive login on a
+    // terminal, unless -t / -T say otherwise; the server may still refuse
+    // (key options, forced commands) and EXEC_OK tells what we got.
     // No environment variables are ever sent: the env list in the wire
     // format is always empty and the server ignores it regardless (the
     // client must not be able to set variables in the remote session).
     // TERM is the only client-supplied value the server applies, and it is
     // a dedicated terminal-type field, not an environment mechanism.
+    let want_pty = opts.pty.unwrap_or(opts.argv.is_empty() && pty::isatty(0));
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
     let (rows, cols) = pty::get_winsize(0);
     send_msg(
         &mut writer,
         &mut sb,
-        &Msg::Exec { argv: opts.argv, term, rows, cols, env: Vec::new() },
+        &Msg::Exec { argv: opts.argv, term, rows, cols, pty: want_pty, env: Vec::new() },
     )?;
+    let got_pty = match recv_msg(&mut reader, &mut ob)? {
+        Msg::ExecOk { pty } => pty,
+        _ => return Err(Error::proto("expected EXEC_OK")),
+    };
+    if want_pty && !got_pty {
+        eprintln!("saltsh: the server did not allocate a terminal for this session");
+    }
 
-    // 8. Session pump: raw mode + signal forwarding on the stdin side,
+    // 8. Session pump: input + signal forwarding on the stdin side,
     //    socket->stdout on this side. Timeouts come off — idle interactive
-    //    sessions must survive.
+    //    sessions must survive. The local terminal goes raw only for a
+    //    remote terminal; otherwise it stays cooked, so line editing and
+    //    echo stay local, ^D ends the input (sent as EOF), and ^C/^Z are
+    //    forwarded as signals.
     wire::clear_timeouts(&reader)?;
-    let _raw = if pty::isatty(0) { Some(RawMode::enter(0)?) } else { None };
+    let _raw = if got_pty && pty::isatty(0) { Some(RawMode::enter(0)?) } else { None };
     install_signal_handlers();
-    let stdin_thread = thread::spawn(move || stdin_pump(writer, sb));
+    let stdin_thread = thread::spawn(move || stdin_pump(writer, sb, got_pty));
     let code = session_recv_loop(reader, &mut ob);
     STOP_PUMP.store(true, Ordering::Relaxed);
     let _ = stdin_thread.join(); // exits within the 200 ms poll cadence
@@ -204,10 +217,31 @@ fn load_identity(opts: &ClientOpts) -> Result<sshkeys::KeyPair> {
 
 /// TOFU: verify the host signature; on first contact show the fingerprint
 /// and (unless `--accept-new`) ask for confirmation; on key change, fail.
+///
+/// A key is only ever pinned after the server has proven it holds the
+/// matching private key (valid signature over this session), and the
+/// confirmation is read from the controlling terminal — never from stdin,
+/// which may carry session input (`... | saltsh host -- cmd`).
 fn verify_host_key(opts: &ClientOpts, host_pk: &[u8; 32], sid: &[u8; 32], sig: &[u8; 64]) -> Result<()> {
     let path = tofu::known_hosts_path()?;
     let entries = tofu::load(&path);
-    let mut pinned = tofu::find(&entries, &opts.host, opts.port).copied();
+    let pinned = tofu::find(&entries, &opts.host, opts.port).copied();
+
+    if pinned.is_some_and(|p| p != *host_pk) {
+        return Err(Error::HostKey(format!(
+            "REMOTE HOST IDENTIFICATION HAS CHANGED for '{}:{}'!\n\
+             The server presented a different key than the pinned one. This could\n\
+             mean a man-in-the-middle attack, or the host key was legitimately\n\
+             rotated. Refusing to connect.",
+            opts.host, opts.port
+        )));
+    }
+
+    // verify_strict: also rejects small-order R and weak public keys.
+    let vk = VerifyingKey::from_bytes(host_pk)
+        .map_err(|e| Error::HostKey(format!("server sent an invalid host key: {e}")))?;
+    vk.verify_strict(&msg::host_auth_message(sid), &Signature::from_bytes(sig))
+        .map_err(|_| Error::HostKey("host key signature verification failed".into()))?;
 
     if pinned.is_none() {
         eprintln!(
@@ -220,39 +254,40 @@ fn verify_host_key(opts: &ClientOpts, host_pk: &[u8; 32], sid: &[u8; 32], sig: &
                 "Warning: Permanently added '{}:{}' to the list of known hosts.",
                 opts.host, opts.port
             );
-        } else {
-            eprint!("Are you sure you want to continue connecting (yes/no)? ");
-            std::io::stdout().flush().ok();
-            let mut line = String::new();
-            std::io::stdin()
-                .read_line(&mut line)
-                .map_err(|e| Error::HostKey(format!("cannot read confirmation: {e}")))?;
-            if !line.trim().eq_ignore_ascii_case("yes") {
-                return Err(Error::HostKey("host key not accepted — aborting".into()));
-            }
+        } else if !confirm_on_tty("Are you sure you want to continue connecting (yes/no)? ")? {
+            return Err(Error::HostKey("host key not accepted — aborting".into()));
         }
         tofu::add(&path, &opts.host, opts.port, host_pk)?;
-        pinned = Some(*host_pk);
     }
-
-    let pinned = pinned.expect("just set");
-    if pinned != *host_pk {
-        return Err(Error::HostKey(format!(
-            "REMOTE HOST IDENTIFICATION HAS CHANGED for '{}:{}'!\n\
-             The server presented a different key than the pinned one. This could\n\
-             mean a man-in-the-middle attack, or the host key was legitimately\n\
-             rotated. Refusing to connect.",
-            opts.host, opts.port
-        )));
-    }
-
-    let vk = VerifyingKey::from_bytes(&pinned)
-        .map_err(|e| Error::Crypto(format!("bad pinned host key: {e}")))?;
-    let msg = [HOST_SIG_CONTEXT, sid.as_ref()].concat();
-    let signature = Signature::from_bytes(sig);
-    vk.verify(&msg, &signature)
-        .map_err(|_| Error::HostKey("host key signature verification failed".into()))?;
     Ok(())
+}
+
+/// Ask a yes/no question on the controlling terminal (like ssh). Without a
+/// terminal the answer is "no": non-interactive use must pin keys
+/// explicitly (`--accept-new`, or `saltsh hostkey` pre-seeding).
+fn confirm_on_tty(question: &str) -> Result<bool> {
+    use std::io::{BufRead, BufReader, Read};
+    let tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|_| {
+            Error::HostKey(
+                "no terminal to confirm the new host key; use --accept-new or \
+                 pre-seed ~/.saltsh/known_hosts (see 'saltsh hostkey')"
+                    .into(),
+            )
+        })?;
+    let mut w = &tty;
+    w.write_all(question.as_bytes())
+        .and_then(|_| w.flush())
+        .map_err(|e| Error::HostKey(format!("cannot prompt: {e}")))?;
+    let mut line = String::new();
+    BufReader::new(&tty)
+        .take(256)
+        .read_line(&mut line)
+        .map_err(|e| Error::HostKey(format!("cannot read confirmation: {e}")))?;
+    Ok(line.trim().eq_ignore_ascii_case("yes"))
 }
 
 // ---------------------------------------------------------------------------
@@ -291,15 +326,17 @@ fn install_signal_handlers() {
 }
 
 /// Pump stdin -> socket, plus signal forwarding. Runs on its own thread so a
-/// backpressured direction can't deadlock the other.
-fn stdin_pump(mut writer: TcpStream, mut sb: SealBox) {
+/// backpressured direction can't deadlock the other. At end of input it
+/// sends EOF once and keeps forwarding signals until the session ends.
+fn stdin_pump(mut writer: TcpStream, mut sb: SealBox, remote_pty: bool) {
     let mut buf = [0u8; 16384];
+    let mut stdin_open = true;
     loop {
         if STOP_PUMP.load(Ordering::Relaxed) {
             break;
         }
         let f = SIGNAL_FLAGS.swap(0, Ordering::Relaxed);
-        if f & FLAG_WINCH != 0 {
+        if f & FLAG_WINCH != 0 && remote_pty {
             let (rows, cols) = pty::get_winsize(0);
             if !send_msg_quiet(&mut writer, &mut sb, &Msg::Resize { rows, cols }) {
                 break;
@@ -312,6 +349,11 @@ fn stdin_pump(mut writer: TcpStream, mut sb: SealBox) {
             break;
         }
 
+        if !stdin_open {
+            // nothing to read any more; just wait for signals / the end
+            unsafe { libc::poll(std::ptr::null_mut(), 0, 200) };
+            continue;
+        }
         let mut pfd = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
         let n = unsafe { libc::poll(&mut pfd, 1, 200) };
         if n < 0 {
@@ -330,8 +372,16 @@ fn stdin_pump(mut writer: TcpStream, mut sb: SealBox) {
                 if !send_msg_quiet(&mut writer, &mut sb, &Msg::PtyData(data)) {
                     break;
                 }
+            } else if r < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+                continue; // a forwarded signal interrupted the read: not EOF
             } else {
-                break; // EOF or error: nothing more to send
+                // EOF (or a read error): tell the server the input is over
+                stdin_open = false;
+                if !send_msg_quiet(&mut writer, &mut sb, &Msg::Eof) {
+                    break;
+                }
             }
         }
     }
@@ -398,6 +448,7 @@ mod tests {
             accept_new: false,
             protocol: None,
             argv: vec![],
+            pty: None,
         };
         assert_eq!(o.host, "h");
     }

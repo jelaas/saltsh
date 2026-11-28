@@ -1296,7 +1296,7 @@ fn interop_with_ssh_keygen() {
 /// another process's fd table, which some sandboxes deny.
 fn session_fd_targets(port: u16, identity: &Path, dir: &TempDir) -> Vec<String> {
     let out = client_cmd(port, identity, dir, "127.0.0.1")
-        .args(["-t", "--", "/bin/ls", "-l", "/proc/self/fd/"])
+        .args(["-t", "--", "/bin/ls", "-l", "--color=never", "/proc/self/fd/"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(0), "listing failed");
@@ -1304,8 +1304,28 @@ fn session_fd_targets(port: u16, identity: &Path, dir: &TempDir) -> Vec<String> 
     String::from_utf8_lossy(&out)
         .lines()
         .filter_map(|l| l.split_once(" -> ").map(|(_, t)| t.trim().to_string()))
+        .map(|t| strip_ansi(&t))
         .filter(|t| !t.starts_with("/proc/"))
         .collect()
+}
+
+/// Strip ANSI SGR/CSI escape sequences (ls may still colorize on some
+/// toolchains even with --color=never).
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break; // 'm' terminates an SGR sequence
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[test]
